@@ -16,7 +16,8 @@ The goal is simple: bundle the current project, upload it to WAI School, and ret
    - If the current workspace has `index.html`, use the current workspace.
    - If the project exists only as code in the chat, first save it as one local `.html` file, then publish that file.
    - If there are several folders, ask one short question: which folder should be published?
-   - Local CSS, JS, images, audio, and fonts are allowed; the publisher will inline supported local assets.
+   - Local CSS, JS, images, audio, video, JSON levels, fonts, GLB/GLTF models, and WASM are allowed; the publisher uploads supported local files with the project.
+   - Keep the project compact: up to 160 files, 10 MB per file, 50 MB total local files.
 
 2. Run a local validation first:
 
@@ -36,10 +37,26 @@ python3 scripts/publish_project.py --dry-run --dir ./my-project
 python3 scripts/publish_project.py --dir .
 ```
 
+If the student is continuing an existing WAI School project from a new chat, pass the existing public link:
+
+```bash
+python3 scripts/publish_project.py --restore --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
+python3 scripts/publish_project.py --dry-run --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
+python3 scripts/publish_project.py --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
+```
+
+If the prompt includes a scoped `publish-token`, pass it as a CLI argument. Never save it in project files or repeat it to the student:
+
+```bash
+python3 scripts/publish_project.py --project https://wai.school/project/... --publish-token <token> --dir .
+```
+
 4. Read the script output.
    - If it returns `ok: true`, tell the student the exact `url`.
    - If it returns `updated: true`, say that the same link was updated.
-   - If it returns an error, explain the exact problem and the smallest next fix.
+   - If it says `Missing local project file`, create or fix the referenced local file/path, rerun `--dry-run`, then publish.
+   - If it returns a validation error, explain it in plain words and suggest one small fix.
+   - If it returns a server, network, or token error, tell the student: "Не получилось опубликовать автоматически. Позови ментора." Keep the exact error for the mentor.
    - Never claim the project was published unless the script returned a URL.
 
 ## Output Style
@@ -80,7 +97,8 @@ If Claude's code environment cannot reach `wai.school`, say this exactly and sto
 ## Rules
 
 - Do not upload `.env`, API keys, tokens, passwords, private keys, or backend source code.
-- Publish only static student projects: HTML, CSS, JS, images, audio, fonts.
+- Publish only static student projects: HTML, CSS, JS, images, audio, video, fonts, JSON, GLB/GLTF, and WASM.
+- Use a clean project folder so unrelated local files are not uploaded by mistake.
 - If there is no HTML file, create one from the project code or ask one short question.
 - Do not use another hosting service.
 - Do not make up a `wai.school` URL.
