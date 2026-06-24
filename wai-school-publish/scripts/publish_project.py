@@ -20,10 +20,27 @@ import urllib.request
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-06-22.2"
-MAX_INLINE_ASSET_BYTES = 900_000
+SKILL_VERSION = "2026-06-24.1"
+MAX_INLINE_ASSET_BYTES = 2_000_000
+STATE_FILE_NAME = ".wai-school-project.json"
 
 TEXT_EXTENSIONS = {".html", ".htm", ".css", ".js", ".mjs", ".svg", ".txt", ".json"}
+INLINE_ASSET_EXTENSIONS = (
+    "png",
+    "jpe?g",
+    "gif",
+    "webp",
+    "avif",
+    "bmp",
+    "svg",
+    "mp3",
+    "wav",
+    "ogg",
+    "m4a",
+    "woff2?",
+    "ttf",
+    "otf",
+)
 IGNORED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build"}
 SECRET_FILE_NAMES = {".env", ".env.local", ".env.production"}
 SECRET_PATTERNS = [
@@ -104,13 +121,36 @@ def inline_text_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
     base = html_path.parent
     warnings: list[str] = []
 
+    def inline_css_urls(css: str, css_base: Path) -> str:
+        def url_repl(match: re.Match[str]) -> str:
+            quote = match.group("quote") or ""
+            raw_url = match.group("url").strip()
+            asset = local_asset_path(css_base, raw_url)
+            if not asset:
+                return match.group(0)
+            size = asset.stat().st_size
+            if size > MAX_INLINE_ASSET_BYTES:
+                warnings.append(f"CSS asset too large to inline: {asset.name}")
+                return match.group(0)
+            mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+            encoded = base64.b64encode(asset.read_bytes()).decode("ascii")
+            return f"url({quote}data:{mime};base64,{encoded}{quote})"
+
+        asset_ext_pattern = "|".join(INLINE_ASSET_EXTENSIONS)
+        return re.sub(
+            rf"url\(\s*(?P<quote>['\"]?)(?P<url>[^)'\"]+\.({asset_ext_pattern})(?:[?#][^'\")]*)?)(?P=quote)\s*\)",
+            url_repl,
+            css,
+            flags=re.I,
+        )
+
     def style_repl(match: re.Match[str]) -> str:
         href = match.group("href")
         asset = local_asset_path(base, href)
         if not asset:
             warnings.append(f"CSS not inlined: {href}")
             return match.group(0)
-        return f"<style>\n{read_text(asset)}\n</style>"
+        return f"<style>\n{inline_css_urls(read_text(asset), asset.parent)}\n</style>"
 
     def script_repl(match: re.Match[str]) -> str:
         src = match.group("src")
@@ -129,6 +169,16 @@ def inline_text_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
     html = re.sub(
         r"<script\b(?=[^>]*src=[\"'](?P<src>[^\"']+)[\"'])[^>]*>\s*</script>",
         script_repl,
+        html,
+        flags=re.I,
+    )
+
+    def inline_style_block(match: re.Match[str]) -> str:
+        return f"{match.group('open')}{inline_css_urls(match.group('css'), base)}{match.group('close')}"
+
+    html = re.sub(
+        r"(?P<open><style\b[^>]*>)(?P<css>[\s\S]*?)(?P<close></style>)",
+        inline_style_block,
         html,
         flags=re.I,
     )
@@ -154,8 +204,9 @@ def inline_binary_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
         encoded = base64.b64encode(asset.read_bytes()).decode("ascii")
         return f'{prefix}data:{mime};base64,{encoded}{suffix}'
 
+    asset_ext_pattern = "|".join(INLINE_ASSET_EXTENSIONS + ("mp4", "webm"))
     html = re.sub(
-        r"(?P<prefix>\b(?:src|href)=['\"])(?P<src>[^'\"]+\.(?:png|jpe?g|gif|webp|svg|mp3|wav|ogg|woff2?|ttf))(?P<suffix>['\"])",
+        rf"(?P<prefix>\b(?:src|href|poster)=['\"])(?P<src>[^'\"]+\.(?:{asset_ext_pattern})(?:[?#][^'\"]*)?)(?P<suffix>['\"])",
         repl,
         html,
         flags=re.I,
@@ -180,16 +231,58 @@ def bundle_html(root_or_file: Path) -> tuple[str, str, list[str]]:
     return html, title[:80] or "Мой проект", warnings
 
 
-def publish(html: str, title: str) -> dict:
-    payload = json.dumps(
-        {
-            "html": html,
-            "title": title,
-            "source": "claude-ai-skill",
-            "skillVersion": SKILL_VERSION,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+def state_path(root_or_file: Path) -> Path:
+    return (root_or_file if root_or_file.is_dir() else root_or_file.parent) / STATE_FILE_NAME
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    slug = str(data.get("slug") or "")
+    edit_token = str(data.get("editToken") or "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,80}", slug):
+        return {}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", edit_token):
+        return {}
+    return {"slug": slug, "editToken": edit_token}
+
+
+def save_state(path: Path, result: dict) -> None:
+    slug = str(result.get("slug") or "")
+    edit_token = str(result.get("editToken") or "")
+    if not slug or not edit_token:
+        return
+    path.write_text(
+        json.dumps(
+            {
+                "slug": slug,
+                "editToken": edit_token,
+                "url": result.get("url"),
+                "updatedAt": result.get("updatedAt"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def publish(html: str, title: str, state: dict) -> dict:
+    payload_data = {
+        "html": html,
+        "title": title,
+        "source": "claude-ai-publisher",
+        "skillVersion": SKILL_VERSION,
+    }
+    if state.get("slug") and state.get("editToken"):
+        payload_data["slug"] = state["slug"]
+        payload_data["editToken"] = state["editToken"]
+
+    payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         ENDPOINT,
         data=payload,
@@ -234,11 +327,29 @@ def main() -> None:
         fail(f"Path does not exist: {target}")
 
     html, title, warnings = bundle_html(target)
+    state_file = state_path(target)
+    state = load_state(state_file)
     if args.dry_run:
-        print(json.dumps({"ok": True, "title": title, "bytes": len(html.encode("utf-8")), "warnings": warnings}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "title": title,
+                    "bytes": len(html.encode("utf-8")),
+                    "warnings": warnings,
+                    "knownProject": state.get("slug"),
+                },
+                ensure_ascii=False,
+            )
+        )
         return
 
-    result = publish(html, title)
+    result = publish(html, title, state)
+    if result.get("ok"):
+        save_state(state_file, result)
+        if result.get("editToken"):
+            result["projectStateSaved"] = True
+            del result["editToken"]
     result["warnings"] = warnings
     print(json.dumps(result, ensure_ascii=False))
 
