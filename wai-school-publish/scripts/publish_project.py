@@ -123,6 +123,9 @@ JS_LOCAL_REF_PATTERNS = [
     re.compile(r"""\bnew\s+URL\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*,"""),
     re.compile(r"""\b(?:import|export)\s+(?:[^'"]+\s+from\s+)?(['"])(?P<url>[^'"]+)\1"""),
     re.compile(r"""\bnew\s+(?:Worker|SharedWorker)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
+    re.compile(r"""\bnew\s+(?:Audio|Image)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
+    re.compile(r"""\b(?:src|href)\s*=\s*(['"`])(?P<url>[^'"`]+)\1"""),
+    re.compile(r"""\bsetAttribute\s*\(\s*['"](?:src|href|poster)['"]\s*,\s*(['"`])(?P<url>[^'"`]+)\1"""),
 ]
 GLTF_URI_RE = re.compile(r"""["']uri["']\s*:\s*["'](?P<url>[^"']+)["']""", re.I)
 ACTION_SIGNAL_RE = re.compile(
@@ -378,12 +381,9 @@ def unique_signal_count(pattern: re.Pattern[str], text: str) -> int:
 
 def project_asset_counts(root_or_file: Path, html_path: Path) -> dict[str, int]:
     project_root = html_path.parent if root_or_file.is_file() else root_or_file
-    if root_or_file.is_file():
-        referenced: set[Path] = set()
-        collect_referenced_project_files(html_path, project_root, referenced, set())
-        candidate_files = sorted(referenced)
-    else:
-        candidate_files = project_files(project_root)
+    referenced: set[Path] = set()
+    collect_referenced_project_files(html_path, project_root, referenced, set())
+    candidate_files = sorted(referenced)
 
     counts = {"visual": 0, "audio": 0, "model": 0}
     for path in candidate_files:

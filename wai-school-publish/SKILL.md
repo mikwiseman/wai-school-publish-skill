@@ -98,6 +98,7 @@ If Claude's code environment cannot reach `wai.school`, say this exactly and sto
 
 - Do not upload `.env`, API keys, tokens, passwords, private keys, or backend source code.
 - Publish only static student projects: HTML, CSS, JS, images, audio, video, fonts, JSON, GLB/GLTF, and WASM.
+- Keep everything local inside the project folder: no CDN, external API calls, WebSocket/EventSource, service workers, cookies, localStorage, sessionStorage, IndexedDB, or Cache API.
 - Use a clean project folder so unrelated local files are not uploaded by mistake.
 - If there is no HTML file, create one from the project code or ask one short question.
 - Do not use another hosting service.
