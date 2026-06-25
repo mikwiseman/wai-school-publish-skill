@@ -144,6 +144,10 @@ GAME_SIGNAL_RE = re.compile(
     r"""<\s*canvas\b|\b(player|enemy|enemies|boss|collision|particle|sprite|tilemap|physics|keydown|keyup|pointerlock)\b""",
     re.I,
 )
+SPORTS_GAME_SIGNAL_RE = re.compile(
+    r"""\b(soccer|football|goal|goals|ball|keeper|striker|stadium|arena|match|scoreboard|field|monster soccer|футбол|гол|мяч|ворот|вратар|стадион|арен|матч|табло|поле)\b""",
+    re.I,
+)
 GAME_INPUT_RE = re.compile(r"""\b(keydown|keyup|pointer|mousemove|touch|click|addEventListener)\b""", re.I)
 GOAL_SIGNAL_RE = re.compile(
     r"""\b(goal|mission|target|collect|find|escape|open|finish|objective|quest|keys?|cores?|coins?|цель|миссия|собери|найди|побед|выход)\b""",
@@ -171,6 +175,14 @@ GAME_PRESENTATION_RE = re.compile(
 )
 GAME_SYSTEM_RE = re.compile(
     r"""\b(enemy|enemies|drone|drones|guard|hazard|boss|phase|wave|waves|spawn|ai|behavior|patrol|path|pathfinding|cooldown|ability|dash|attack|health|damage|shield|inventory|quest|dialog|cutscene|checkpoint|room|level|stage|unlock|timer|objective|mission|collision|physics|camera|parallax|minimap|gate|core|cores|collectible|relic|energy)\b""",
+    re.I,
+)
+PRIMITIVE_SHAPE_SIGNAL_RE = re.compile(
+    r"""\b(border-radius\s*:\s*(?:50%|999px)|ctx\.arc|\.arc\s*\(|drawMonster|drawCircle|circle|ellipse|rounded-full|прост(?:ые|ыми)\s+фигур)\b""",
+    re.I,
+)
+SPORTS_ARENA_RE = re.compile(
+    r"""\b(stadium|crowd|stands|keeper phases?|goal replay|replay|confetti|charged shots?|ball physics|goal net|announcer|scoreboard pulse|goal camera|slow motion|стадион|трибун|толп|репле[йя]|конфетти|заряженн|физик[аи]\s+мяч|сетка|табло)\b""",
     re.I,
 )
 MULTIFILE_SIGNAL_RE = re.compile(
@@ -407,6 +419,9 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
     has_feedback = bool(FEEDBACK_SIGNAL_RE.search(all_text))
     has_visual = bool(VISUAL_SIGNAL_RE.search(all_text))
     looks_like_game = bool(GAME_SIGNAL_RE.search(all_text))
+    looks_like_sports_game = bool(SPORTS_GAME_SIGNAL_RE.search(all_text)) and (
+        looks_like_game or has_canvas or "requestAnimationFrame" in all_text
+    )
     weak_alert_demo = bool(re.search(r"\balert\s*\(", all_text)) and not (
         re.search(r"\b(textContent|innerHTML|classList|requestAnimationFrame)\b", all_text)
     )
@@ -429,7 +444,7 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
         fail("Project quality check failed: add visible feedback, state, progress, score, result, or scene change before publishing.")
     if not has_visual:
         fail("Project quality check failed: add a stronger visual surface: canvas, scene, cards, panels, grid, animation, transition, or styled result.")
-    if looks_like_game and (has_canvas or "requestAnimationFrame" in all_text):
+    if (looks_like_game or has_canvas or looks_like_sports_game) and (has_canvas or "requestAnimationFrame" in all_text):
         if "requestAnimationFrame" not in all_text:
             fail("Project quality check failed: canvas games need a requestAnimationFrame game loop before publishing.")
         if not GAME_INPUT_RE.search(all_text):
@@ -445,7 +460,7 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
         "choice": bool(CHOICE_SIGNAL_RE.search(all_text)),
     }
     layer_count = sum(quality_layers.values())
-    if looks_like_game or has_canvas:
+    if looks_like_game or has_canvas or looks_like_sports_game:
         if layer_count < 3:
             fail(
                 "Project quality check failed: games need more than a primitive demo. "
@@ -463,6 +478,16 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
             fail(
                 "Project quality check failed: game visuals are too flat. "
                 "Add camera/layers, procedural sprites or image assets, lighting, parallax, tiles/props, animation frames, shadows, and stronger effects before publishing."
+            )
+        if (
+            looks_like_sports_game
+            and PRIMITIVE_SHAPE_SIGNAL_RE.search(all_text)
+            and unique_signal_count(SPORTS_ARENA_RE, all_text) < 2
+            and rich_asset_count < 2
+        ):
+            fail(
+                "Project quality check failed: sports and arena games need more than primitive shapes. "
+                "Add stadium/crowd, ball or shot physics, keeper phases, replay/confetti, and stronger arena feedback before publishing."
             )
     elif layer_count < 2:
         fail(
