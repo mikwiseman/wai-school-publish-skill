@@ -29,9 +29,10 @@ MAX_PROJECT_FILE_BYTES = 10_000_000
 MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
 STATE_FILE_NAME = ".wai-school-project.json"
 
-TEXT_EXTENSIONS = {".html", ".htm", ".css", ".gltf", ".js", ".mjs", ".svg", ".txt", ".json"}
+TEXT_EXTENSIONS = {".html", ".htm", ".css", ".gltf", ".js", ".mjs", ".txt", ".json"}
 PROJECT_FILE_EXTENSIONS = {
     ".avif",
+    ".bin",
     ".bmp",
     ".css",
     ".flac",
@@ -88,6 +89,23 @@ SECRET_PATTERNS = [
     re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*[\"'][^\"']{8,}[\"']", re.I),
     re.compile(r"\b(?:OPENAI|ANTHROPIC|GEMINI|NOTION|RESEND|WAIPAY)_[A-Z0-9_]*\s*[:=]", re.I),
 ]
+FORBIDDEN_RUNTIME_ERROR = (
+    "Project quality check failed: external network, external assets, browser storage, "
+    "service workers, cookies, IndexedDB, and Cache API are not allowed. "
+    "Keep every asset local inside the project folder."
+)
+FORBIDDEN_RUNTIME_PATTERNS = [
+    re.compile(r"\b(?:src|srcset|href|poster|action)\s*=\s*[\"']?\s*(?:https?:)?//", re.I),
+    re.compile(r"\burl\(\s*[\"']?\s*(?:https?:)?//", re.I),
+    re.compile(r"@import\s+(?:url\(\s*)?[\"']?\s*(?:https?:)?//", re.I),
+    re.compile(r"\b(?:fetch|importScripts)\s*\(\s*['\"`]\s*(?:https?:)?//", re.I),
+    re.compile(r"\bimport\s*\(\s*['\"`]\s*(?:https?:)?//", re.I),
+    re.compile(r"\b(?:import|export)\s+(?:[\s\S]{0,200}?\s+from\s+)?['\"`]\s*(?:https?:)?//", re.I),
+    re.compile(r"\bnew\s+(?:WebSocket|EventSource)\s*\(\s*['\"`]\s*(?:wss?:|https?:)?//", re.I),
+    re.compile(r"\bnavigator\.sendBeacon\s*\(\s*['\"`]\s*(?:https?:)?//", re.I),
+    re.compile(r"\bXMLHttpRequest\b[\s\S]{0,800}\.open\s*\(\s*['\"`][A-Z]+['\"`]\s*,\s*['\"`]\s*(?:https?:)?//", re.I),
+    re.compile(r"\b(?:localStorage|sessionStorage|indexedDB|document\.cookie|navigator\.serviceWorker|caches)\b", re.I),
+]
 HTML_LOCAL_REF_RE = re.compile(
     r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(?:(['"])(?P<quoted>[^'"]+)\1|(?P<unquoted>[^\s"'=<>`]+))""",
     re.I,
@@ -103,6 +121,7 @@ JS_LOCAL_REF_PATTERNS = [
     re.compile(r"""\b(?:import|export)\s+(?:[^'"]+\s+from\s+)?(['"])(?P<url>[^'"]+)\1"""),
     re.compile(r"""\bnew\s+(?:Worker|SharedWorker)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
 ]
+GLTF_URI_RE = re.compile(r"""["']uri["']\s*:\s*["'](?P<url>[^"']+)["']""", re.I)
 ACTION_SIGNAL_RE = re.compile(
     r"""\b(addEventListener|onclick|onpointer|onmouse|ontouch|onkey|onsubmit|onchange)\b|<\s*(button|input|select|textarea)\b""",
     re.I,
@@ -117,6 +136,31 @@ VISUAL_SIGNAL_RE = re.compile(
 )
 GAME_SIGNAL_RE = re.compile(r"""<\s*canvas\b|\brequestAnimationFrame\b|\b(game|player|level|score|collision|particle|sprite)\b""", re.I)
 GAME_INPUT_RE = re.compile(r"""\b(keydown|keyup|pointer|mousemove|touch|click|addEventListener)\b""", re.I)
+GOAL_SIGNAL_RE = re.compile(
+    r"""\b(goal|mission|target|collect|find|escape|open|finish|objective|quest|keys?|cores?|coins?|цель|миссия|собери|найди|побед|выход)\b""",
+    re.I,
+)
+RISK_SIGNAL_RE = re.compile(
+    r"""\b(risk|danger|enemy|hazard|trap|boss|guard|damage|health|energy|timer|timeLeft|lives|lose|lost|опасн|враг|ловуш|босс|охран|урон|жизн|таймер|проигр)\b""",
+    re.I,
+)
+PROGRESS_SIGNAL_RE = re.compile(
+    r"""<\s*progress\b|\b(progress|level|stage|scene|score|combo|meter|energy|inventory|unlock|phase|state|result|impact|уров|сч[её]т|прогресс|результат|этап|режим)\b""",
+    re.I,
+)
+END_STATE_SIGNAL_RE = re.compile(
+    r"""\b(win|won|lose|lost|complete|completed|finish|final|ending|result|success|fail|game over|try again|restart|побед|финал|конец|готово|проигр|снова)\b""",
+    re.I,
+)
+EFFECT_SIGNAL_RE = re.compile(
+    r"""\b(requestAnimationFrame|AudioContext|Oscillator|particle|particles|burst|shake|glow|confetti|animation|transition|transform|parallax|trail|sound|audio|свет|звук|частиц)\b""",
+    re.I,
+)
+MULTIFILE_SIGNAL_RE = re.compile(
+    r"""\b(levels?/|data/|assets?/|fetch\s*\(\s*['"`][^'"`]+\.json|import\s+|export\s+|class\s+\w+)\b""",
+    re.I,
+)
+CHOICE_SIGNAL_RE = re.compile(r"""\b(choice|choices|selected|option|quiz|question|answer|card|reveal|filter|выбор|вариант|вопрос|ответ|карточ)\b""", re.I)
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -153,6 +197,12 @@ def scan_for_secrets(root: Path) -> None:
         for pattern in SECRET_PATTERNS:
             if pattern.search(text):
                 fail(f"Refusing to publish because {path.relative_to(root)} appears to contain a secret")
+
+
+def validate_no_forbidden_runtime(text: str) -> None:
+    for pattern in FORBIDDEN_RUNTIME_PATTERNS:
+        if pattern.search(text):
+            fail(FORBIDDEN_RUNTIME_ERROR)
 
 
 def choose_html(root: Path) -> Path:
@@ -222,6 +272,28 @@ def resolve_local_reference(base: Path, raw_url: str, project_root: Path, source
         fail(f"Missing local project file referenced from {source.relative_to(project_root)}: {value}")
 
 
+def local_reference_candidate(base: Path, raw_url: str, project_root: Path) -> Path | None:
+    value = (raw_url or "").strip()
+    if is_external_or_virtual_ref(value):
+        return None
+    if "\0" in value or "${" in value or "{" in value or "}" in value:
+        return None
+
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return None
+    ref_path = urllib.parse.unquote(parsed.path or "").strip()
+    if not ref_path or ref_path.startswith("/"):
+        return None
+
+    candidate = (base / ref_path).resolve()
+    try:
+        candidate.relative_to(project_root.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.exists() and candidate.is_file() else None
+
+
 def html_reference_url(match: re.Match[str]) -> str:
     return match.group("quoted") or match.group("unquoted") or ""
 
@@ -242,7 +314,14 @@ def validate_local_references(root_or_file: Path, html_path: Path) -> None:
         resolve_local_reference(html_path.parent, match.group("url"), project_root, html_path)
     validate_js_references(html_path, html, project_root)
 
-    for path in project_files(project_root):
+    if root_or_file.is_file():
+        referenced: set[Path] = set()
+        collect_referenced_project_files(html_path, project_root, referenced, set())
+        candidate_files = sorted(referenced)
+    else:
+        candidate_files = project_files(project_root)
+
+    for path in candidate_files:
         suffix = path.suffix.lower()
         if suffix == ".css":
             text = read_text(path)
@@ -261,10 +340,17 @@ def visible_text_from_html(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def project_quality_text(project_root: Path, html_path: Path) -> tuple[str, str]:
+def project_quality_text(root_or_file: Path, html_path: Path) -> tuple[str, str]:
+    project_root = html_path.parent if root_or_file.is_file() else root_or_file
     html = read_text(html_path)
     chunks = [html]
-    for path in project_files(project_root):
+    if root_or_file.is_file():
+        referenced: set[Path] = set()
+        collect_referenced_project_files(html_path, project_root, referenced, set())
+        candidate_files = sorted(referenced)
+    else:
+        candidate_files = project_files(project_root)
+    for path in candidate_files:
         if path.resolve() == html_path.resolve():
             continue
         if path.suffix.lower() in {".css", ".js", ".mjs", ".json", ".txt"}:
@@ -273,8 +359,8 @@ def project_quality_text(project_root: Path, html_path: Path) -> tuple[str, str]
 
 
 def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
-    project_root = html_path.parent if root_or_file.is_file() else root_or_file
-    html, all_text = project_quality_text(project_root, html_path)
+    html, all_text = project_quality_text(root_or_file, html_path)
+    validate_no_forbidden_runtime(all_text)
     visible_text = visible_text_from_html(html)
     has_canvas = bool(re.search(r"<\s*canvas\b", html, flags=re.I))
     has_action = bool(ACTION_SIGNAL_RE.search(all_text))
@@ -300,6 +386,28 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
             fail("Project quality check failed: canvas games need a requestAnimationFrame game loop before publishing.")
         if not GAME_INPUT_RE.search(all_text):
             fail("Project quality check failed: games need keyboard, pointer, click, or touch input before publishing.")
+
+    quality_layers = {
+        "goal": bool(GOAL_SIGNAL_RE.search(all_text)),
+        "risk": bool(RISK_SIGNAL_RE.search(all_text)),
+        "progress": bool(PROGRESS_SIGNAL_RE.search(all_text)),
+        "end": bool(END_STATE_SIGNAL_RE.search(all_text)),
+        "effect": bool(EFFECT_SIGNAL_RE.search(all_text)),
+        "multi_file": bool(MULTIFILE_SIGNAL_RE.search(all_text)),
+        "choice": bool(CHOICE_SIGNAL_RE.search(all_text)),
+    }
+    layer_count = sum(quality_layers.values())
+    if looks_like_game or has_canvas:
+        if layer_count < 3:
+            fail(
+                "Project quality check failed: games need more than a primitive demo. "
+                "Add a goal, risk or challenge, progress/state, effects, and a win/loss/result moment before publishing."
+            )
+    elif layer_count < 2:
+        fail(
+            "Project quality check failed: pages and mini apps need at least two meaningful layers, "
+            "such as choices plus result, sections plus interaction, or input plus feedback before publishing."
+        )
 
 
 def inline_text_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
@@ -429,11 +537,59 @@ def safe_rel_path(path: Path, base: Path) -> str:
     return rel
 
 
+def add_referenced_project_file(base: Path, raw_url: str, project_root: Path, out: set[Path], seen: set[Path]) -> None:
+    candidate = local_reference_candidate(base, raw_url, project_root)
+    if not candidate:
+        return
+    out.add(candidate)
+    collect_referenced_project_files(candidate, project_root, out, seen)
+
+
+def collect_referenced_project_files(source: Path, project_root: Path, out: set[Path], seen: set[Path]) -> None:
+    resolved = source.resolve()
+    if resolved in seen:
+        return
+    seen.add(resolved)
+
+    suffix = source.suffix.lower()
+    if suffix not in TEXT_EXTENSIONS:
+        return
+
+    text = read_text(source)
+    js_text = ""
+    if suffix in {".html", ".htm"}:
+        for match in HTML_LOCAL_REF_RE.finditer(text):
+            add_referenced_project_file(source.parent, html_reference_url(match), project_root, out, seen)
+        for match in CSS_URL_RE.finditer(text):
+            add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
+        js_text = text
+    elif suffix == ".css":
+        for match in CSS_URL_RE.finditer(text):
+            add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
+    elif suffix in {".js", ".mjs"}:
+        js_text = text
+    elif suffix == ".gltf":
+        for match in GLTF_URI_RE.finditer(text):
+            add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
+
+    if js_text:
+        for pattern in JS_LOCAL_REF_PATTERNS:
+            for match in pattern.finditer(js_text):
+                add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
+
+
 def project_file_manifest(root_or_file: Path, html_path: Path) -> list[dict]:
     base = html_path.parent
     files: list[dict] = []
     total_bytes = 0
-    for path in project_files(base):
+    if root_or_file.is_file():
+        referenced: set[Path] = set()
+        collect_referenced_project_files(html_path, base, referenced, set())
+        candidate_files = sorted(referenced)
+    else:
+        candidate_files = project_files(base)
+
+    for path in candidate_files:
         if path.resolve() == html_path.resolve():
             continue
         suffix = path.suffix.lower()
@@ -755,6 +911,8 @@ def main() -> None:
     parser.add_argument("--dir", default=".", help="Project folder or HTML file to publish")
     parser.add_argument("--publish-token", default="", help="Scoped WAI School child publish token")
     parser.add_argument("--project", default="", help="Existing wai.school/project/... URL or slug to update with a publish token")
+    parser.add_argument("--expect-url", default="", help="Fail unless the server returns this exact public project URL")
+    parser.add_argument("--require-updated", action="store_true", help="Fail unless the server confirms updated: true")
     parser.add_argument("--restore", action="store_true", help="Restore an existing owned project into --dir before editing")
     parser.add_argument("--force", action="store_true", help="Allow --restore to replace files in the target folder")
     parser.add_argument("--dry-run", action="store_true", help="Bundle and validate locally, but do not upload")
@@ -763,6 +921,9 @@ def main() -> None:
     target = Path(args.dir).expanduser().resolve()
     publish_token = (args.publish_token or os.environ.get("WAI_SCHOOL_PUBLISH_TOKEN", "")).strip()
     explicit_slug = project_arg_to_slug(args.project)
+    expected_url = (args.expect_url or "").strip()
+    if expected_url:
+        project_arg_to_slug(expected_url)
     if args.restore:
         if not explicit_slug:
             fail("Restoring a project needs --project with a wai.school/project/... URL or slug.")
@@ -803,6 +964,10 @@ def main() -> None:
 
     result = publish(html, title, state, files, publish_token)
     if result.get("ok"):
+        if expected_url and result.get("url") != expected_url:
+            fail(f"Publish returned a different URL; expected {expected_url}, got {result.get('url') or ''}")
+        if args.require_updated and result.get("updated") is not True:
+            fail("Publish did not update an existing project; expected updated: true")
         if save_state(state_file, result):
             result["projectStateSaved"] = True
         if result.get("editToken"):
