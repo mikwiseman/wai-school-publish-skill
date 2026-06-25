@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-06-25.1"
+SKILL_VERSION = "2026-06-25.2"
 MAX_INLINE_ASSET_BYTES = 2_000_000
 MAX_PROJECT_FILES = 160
 MAX_PROJECT_FILE_BYTES = 10_000_000
@@ -30,6 +30,9 @@ MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
 STATE_FILE_NAME = ".wai-school-project.json"
 
 TEXT_EXTENSIONS = {".html", ".htm", ".css", ".gltf", ".js", ".mjs", ".txt", ".json"}
+VISUAL_ASSET_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+AUDIO_ASSET_EXTENSIONS = {".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".wav"}
+MODEL_ASSET_EXTENSIONS = {".bin", ".glb", ".gltf", ".wasm"}
 PROJECT_FILE_EXTENSIONS = {
     ".avif",
     ".bin",
@@ -134,7 +137,10 @@ VISUAL_SIGNAL_RE = re.compile(
     r"""<\s*canvas\b|\b(radial-gradient|linear-gradient|animation|transition|transform|box-shadow|grid|scene|card|panel|choice|preview|particles?)\b""",
     re.I,
 )
-GAME_SIGNAL_RE = re.compile(r"""<\s*canvas\b|\brequestAnimationFrame\b|\b(game|player|level|score|collision|particle|sprite)\b""", re.I)
+GAME_SIGNAL_RE = re.compile(
+    r"""<\s*canvas\b|\b(player|enemy|enemies|boss|collision|particle|sprite|tilemap|physics|keydown|keyup|pointerlock)\b""",
+    re.I,
+)
 GAME_INPUT_RE = re.compile(r"""\b(keydown|keyup|pointer|mousemove|touch|click|addEventListener)\b""", re.I)
 GOAL_SIGNAL_RE = re.compile(
     r"""\b(goal|mission|target|collect|find|escape|open|finish|objective|quest|keys?|cores?|coins?|цель|миссия|собери|найди|побед|выход)\b""",
@@ -154,6 +160,14 @@ END_STATE_SIGNAL_RE = re.compile(
 )
 EFFECT_SIGNAL_RE = re.compile(
     r"""\b(requestAnimationFrame|AudioContext|Oscillator|particle|particles|burst|shake|glow|confetti|animation|transition|transform|parallax|trail|sound|audio|свет|звук|частиц)\b""",
+    re.I,
+)
+GAME_PRESENTATION_RE = re.compile(
+    r"""\b(drawImage|createPattern|createLinearGradient|createRadialGradient|shadowBlur|globalCompositeOperation|Path2D|bezierCurveTo|quadraticCurveTo|clip|rotate|scale|translate|camera|viewport|parallax|tilemap|tile|tiles|sprite|spritesheet|atlas|frameIndex|layer|backgroundLayer|foreground|minimap|lighting|screenShake|shake|particle|particles|trail|glow|confetti|texture|biome|prop|props)\b""",
+    re.I,
+)
+GAME_SYSTEM_RE = re.compile(
+    r"""\b(enemy|enemies|drone|drones|guard|hazard|boss|phase|wave|waves|spawn|ai|behavior|patrol|path|pathfinding|cooldown|ability|dash|attack|health|damage|shield|inventory|quest|dialog|cutscene|checkpoint|room|level|stage|unlock|timer|objective|mission|collision|physics|camera|parallax|minimap|gate|core|cores|collectible|relic|energy)\b""",
     re.I,
 )
 MULTIFILE_SIGNAL_RE = re.compile(
@@ -358,8 +372,34 @@ def project_quality_text(root_or_file: Path, html_path: Path) -> tuple[str, str]
     return html, "\n".join(chunks)
 
 
+def unique_signal_count(pattern: re.Pattern[str], text: str) -> int:
+    return len({match.group(0).lower() for match in pattern.finditer(text)})
+
+
+def project_asset_counts(root_or_file: Path, html_path: Path) -> dict[str, int]:
+    project_root = html_path.parent if root_or_file.is_file() else root_or_file
+    if root_or_file.is_file():
+        referenced: set[Path] = set()
+        collect_referenced_project_files(html_path, project_root, referenced, set())
+        candidate_files = sorted(referenced)
+    else:
+        candidate_files = project_files(project_root)
+
+    counts = {"visual": 0, "audio": 0, "model": 0}
+    for path in candidate_files:
+        suffix = path.suffix.lower()
+        if suffix in VISUAL_ASSET_EXTENSIONS:
+            counts["visual"] += 1
+        elif suffix in AUDIO_ASSET_EXTENSIONS:
+            counts["audio"] += 1
+        elif suffix in MODEL_ASSET_EXTENSIONS:
+            counts["model"] += 1
+    return counts
+
+
 def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
     html, all_text = project_quality_text(root_or_file, html_path)
+    asset_counts = project_asset_counts(root_or_file, html_path)
     validate_no_forbidden_runtime(all_text)
     visible_text = visible_text_from_html(html)
     has_canvas = bool(re.search(r"<\s*canvas\b", html, flags=re.I))
@@ -370,11 +410,19 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
     weak_alert_demo = bool(re.search(r"\balert\s*\(", all_text)) and not (
         re.search(r"\b(textContent|innerHTML|classList|requestAnimationFrame)\b", all_text)
     )
+    score_only_demo = bool(re.search(r"\b(score|points?|сч[её]т|очки)\b", all_text, flags=re.I)) and not (
+        GOAL_SIGNAL_RE.search(all_text) or RISK_SIGNAL_RE.search(all_text) or END_STATE_SIGNAL_RE.search(all_text)
+    )
 
     if len(visible_text) < 24 and not has_canvas:
         fail("Project quality check failed: add a real first screen with clear text, action, and result before publishing.")
     if weak_alert_demo:
         fail("Project quality check failed: replace alert-only demo with visible on-page feedback before publishing.")
+    if score_only_demo:
+        fail(
+            "Project quality check failed: games need more than a primitive demo. "
+            "Add a goal, risk or challenge, progress/state, effects, and a win/loss/result moment before publishing."
+        )
     if not has_action:
         fail("Project quality check failed: add a user action such as a button, click, keyboard, pointer, input, or choice before publishing.")
     if not has_feedback:
@@ -402,6 +450,19 @@ def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
             fail(
                 "Project quality check failed: games need more than a primitive demo. "
                 "Add a goal, risk or challenge, progress/state, effects, and a win/loss/result moment before publishing."
+            )
+        system_depth = unique_signal_count(GAME_SYSTEM_RE, all_text)
+        presentation_depth = unique_signal_count(GAME_PRESENTATION_RE, all_text)
+        rich_asset_count = asset_counts["visual"] + asset_counts["audio"] + asset_counts["model"]
+        if system_depth < 5:
+            fail(
+                "Project quality check failed: games need deeper mechanics. "
+                "Add systems such as enemies, hazards, phases, abilities, camera, waves, levels, health, cooldowns, or objectives."
+            )
+        if presentation_depth < 6 and rich_asset_count < 2:
+            fail(
+                "Project quality check failed: game visuals are too flat. "
+                "Add camera/layers, procedural sprites or image assets, lighting, parallax, tiles/props, animation frames, shadows, and stronger effects before publishing."
             )
     elif layer_count < 2:
         fail(
