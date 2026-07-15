@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish a static HTML project and local assets to wai.school.
 
-No third-party dependencies: this script is meant to run inside Claude.ai code
+No third-party dependencies: this script is meant to run inside Claude Code
 execution after the WAI School Publish skill is installed.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import mimetypes
 import os
@@ -19,14 +20,16 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-06-25.2"
+SKILL_VERSION = "2026-07-15.3"
 MAX_INLINE_ASSET_BYTES = 2_000_000
-MAX_PROJECT_FILES = 160
+MAX_PROJECT_FILES = 400
 MAX_PROJECT_FILE_BYTES = 10_000_000
 MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
+NETWORK_TIMEOUT_SECONDS = 120
 STATE_FILE_NAME = ".wai-school-project.json"
 
 TEXT_EXTENSIONS = {".html", ".htm", ".css", ".gltf", ".js", ".mjs", ".txt", ".json"}
@@ -85,6 +88,8 @@ INLINE_ASSET_EXTENSIONS = (
     "otf",
 )
 IGNORED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build"}
+READY_BUILD_DIRS = {"dist", "build", "out", "public"}
+ENTRY_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".next"}
 SECRET_FILE_NAMES = {".env", ".env.local", ".env.production"}
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.I),
@@ -96,6 +101,10 @@ FORBIDDEN_RUNTIME_ERROR = (
     "Project quality check failed: external network, external assets, browser storage, "
     "service workers, cookies, IndexedDB, and Cache API are not allowed. "
     "Keep every asset local inside the project folder."
+)
+FORBIDDEN_DIALOG_ERROR = (
+    "Project quality check failed: browser modal dialogs are not allowed. "
+    "Use visible on-page feedback instead."
 )
 FORBIDDEN_RUNTIME_PATTERNS = [
     re.compile(r"\b(?:src|srcset|href|poster|action)\s*=\s*[\"']?\s*(?:https?:)?//", re.I),
@@ -109,6 +118,7 @@ FORBIDDEN_RUNTIME_PATTERNS = [
     re.compile(r"\bXMLHttpRequest\b[\s\S]{0,800}\.open\s*\(\s*['\"`][A-Z]+['\"`]\s*,\s*['\"`]\s*(?:https?:)?//", re.I),
     re.compile(r"\b(?:localStorage|sessionStorage|indexedDB|document\.cookie|navigator\.serviceWorker|caches)\b", re.I),
 ]
+FORBIDDEN_DIALOG_RE = re.compile(r"\b(?:alert|confirm|prompt)\s*\(", re.I)
 HTML_LOCAL_REF_RE = re.compile(
     r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(?:(['"])(?P<quoted>[^'"]+)\1|(?P<unquoted>[^\s"'=<>`]+))""",
     re.I,
@@ -197,6 +207,15 @@ def fail(message: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+class ProjectPublishHttpError(Exception):
+    def __init__(self, status: int, code: str, message: str, data=None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.data = data or {}
+
+
 def read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -228,7 +247,28 @@ def scan_for_secrets(root: Path) -> None:
                 fail(f"Refusing to publish because {path.relative_to(root)} appears to contain a secret")
 
 
+def ready_build_indexes(root: Path) -> list[Path]:
+    indexes: list[Path] = []
+    for dirpath, dirnames, _filenames in os.walk(root):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name.lower() not in ENTRY_EXCLUDED_DIRS and not name.startswith(".")
+        ]
+        directory = Path(dirpath)
+        if directory == root or directory.name.lower() not in READY_BUILD_DIRS:
+            continue
+        for filename in ("index.html", "index.htm"):
+            candidate = directory / filename
+            if candidate.is_file():
+                indexes.append(candidate)
+        dirnames[:] = []
+    return sorted(indexes)
+
+
 def validate_no_forbidden_runtime(text: str) -> None:
+    if FORBIDDEN_DIALOG_RE.search(text):
+        fail(FORBIDDEN_DIALOG_ERROR)
     for pattern in FORBIDDEN_RUNTIME_PATTERNS:
         if pattern.search(text):
             fail(FORBIDDEN_RUNTIME_ERROR)
@@ -240,9 +280,22 @@ def choose_html(root: Path) -> Path:
             fail("The selected file is not HTML. Create or select index.html first.")
         return root
 
-    index = root / "index.html"
-    if index.exists():
-        return index
+    root_indexes = [candidate for candidate in (root / "index.html", root / "index.htm") if candidate.is_file()]
+    all_build_indexes = ready_build_indexes(root)
+    compiled_build_indexes = [path for path in all_build_indexes if path.parent.name.lower() != "public"]
+    build_indexes = compiled_build_indexes or all_build_indexes
+    if (root / "package.json").is_file() and build_indexes:
+        if len(build_indexes) > 1:
+            options = ", ".join(path.relative_to(root).as_posix() for path in build_indexes)
+            fail(f"Several ready builds were found: {options}. Select the intended build folder explicitly.")
+        return build_indexes[0]
+    if root_indexes:
+        return root_indexes[0]
+    if build_indexes:
+        if len(build_indexes) > 1:
+            options = ", ".join(path.relative_to(root).as_posix() for path in build_indexes)
+            fail(f"Several ready builds were found: {options}. Select the intended build folder explicitly.")
+        return build_indexes[0]
 
     html_files = sorted([p for p in project_files(root) if p.suffix.lower() in {".html", ".htm"}])
     if not html_files:
@@ -595,7 +648,7 @@ def inline_binary_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
 
 def bundle_html(root_or_file: Path) -> tuple[str, str, list[str]]:
     html_path = choose_html(root_or_file)
-    root = html_path.parent if root_or_file.is_file() else root_or_file
+    root = html_path.parent
     scan_for_secrets(root)
 
     html = read_text(html_path)
@@ -705,11 +758,12 @@ def project_file_manifest(root_or_file: Path, html_path: Path) -> list[dict]:
 
 def bundle_project(root_or_file: Path) -> tuple[str, str, list[str], list[dict]]:
     html_path = choose_html(root_or_file)
-    root = html_path.parent if root_or_file.is_file() else root_or_file
+    root = html_path.parent
+    publish_input = html_path if root_or_file.is_file() else root
     scan_for_secrets(root)
-    validate_local_references(root_or_file, html_path)
-    files = project_file_manifest(root_or_file, html_path)
-    validate_project_quality(root_or_file, html_path)
+    validate_local_references(publish_input, html_path)
+    files = project_file_manifest(publish_input, html_path)
+    validate_project_quality(publish_input, html_path)
 
     html = read_text(html_path)
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
@@ -718,29 +772,123 @@ def bundle_project(root_or_file: Path) -> tuple[str, str, list[str], list[dict]]
 
 
 def state_path(root_or_file: Path) -> Path:
-    return (root_or_file if root_or_file.is_dir() else root_or_file.parent) / STATE_FILE_NAME
+    if root_or_file.is_dir() or root_or_file.name.lower() in {"index.html", "index.htm"}:
+        return (root_or_file if root_or_file.is_dir() else root_or_file.parent) / STATE_FILE_NAME
+    identity = hashlib.sha256(root_or_file.name.encode("utf-8")).hexdigest()[:12]
+    return root_or_file.parent / f".wai-school-project-{identity}.json"
 
 
 def load_state(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    slug = str(data.get("slug") or "")
-    edit_token = str(data.get("editToken") or "")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,80}", slug):
-        return {}
-    if re.fullmatch(r"[A-Za-z0-9_-]{24,128}", edit_token):
-        return {"slug": slug, "editToken": edit_token}
-    return {"slug": slug}
+        raw = path.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"Cannot read safe publish state at {path}: {error}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        fail(
+            f"Cannot read safe publish state at {path}: the file is corrupted. "
+            "Do not publish as a new project; restore the live project or ask a mentor to repair the state file."
+        )
+    if not isinstance(data, dict):
+        fail(f"Cannot read safe publish state at {path}: expected a JSON object.")
+
+    state: dict = {}
+    slug = data.get("slug")
+    edit_token = data.get("editToken")
+    create_token = data.get("createToken")
+    pending_request_id = data.get("pendingRequestId")
+    current_revision = data.get("currentRevision")
+
+    if slug is not None:
+        if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,80}", slug):
+            fail(f"Cannot read safe publish state at {path}: invalid project slug.")
+        state["slug"] = slug
+    if edit_token is not None:
+        if not isinstance(edit_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", edit_token):
+            fail(f"Cannot read safe publish state at {path}: invalid edit capability.")
+        state["editToken"] = edit_token
+    if create_token is not None:
+        if not isinstance(create_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", create_token):
+            fail(f"Cannot read safe publish state at {path}: invalid create capability.")
+        state["createToken"] = create_token
+    if pending_request_id is not None:
+        if not isinstance(pending_request_id, str):
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+        try:
+            parsed_request_id = uuid.UUID(pending_request_id)
+        except ValueError:
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+        if str(parsed_request_id) != pending_request_id.lower():
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+        state["pendingRequestId"] = pending_request_id
+    if current_revision is not None:
+        if isinstance(current_revision, bool) or not isinstance(current_revision, int) or current_revision <= 0:
+            fail(f"Cannot read safe publish state at {path}: invalid project revision.")
+        state["currentRevision"] = current_revision
+    if "owned" in data and not isinstance(data["owned"], bool):
+        fail(f"Cannot read safe publish state at {path}: invalid ownership marker.")
+    if data.get("owned") is True:
+        state["owned"] = True
+    if not state:
+        fail(f"Cannot read safe publish state at {path}: no usable project identity or pending request.")
+    if (state.get("editToken") or state.get("owned") or state.get("currentRevision")) and not state.get("slug"):
+        fail(f"Cannot read safe publish state at {path}: project identity is incomplete.")
+    return state
+
+
+def load_project_state(root_or_file: Path) -> tuple[Path, dict]:
+    preferred = state_path(root_or_file)
+    if preferred.exists() or root_or_file.is_dir() or root_or_file.name.lower() in {"index.html", "index.htm"}:
+        return preferred, load_state(preferred)
+
+    legacy = root_or_file.parent / STATE_FILE_NAME
+    if not legacy.exists():
+        return preferred, {}
+
+    html_files = sorted(
+        path.resolve()
+        for path in root_or_file.parent.iterdir()
+        if path.is_file() and not path.name.startswith(".") and path.suffix.lower() in {".html", ".htm"}
+    )
+    if html_files != [root_or_file.resolve()]:
+        fail(
+            f"Cannot safely match legacy publish state {legacy} to {root_or_file.name}: this folder contains several HTML files. "
+            "Move the selected project into its own folder or ask a mentor to identify the correct project state."
+        )
+
+    state = load_state(legacy)
+    try:
+        write_state_atomic(preferred, state)
+        legacy.unlink()
+    except OSError as error:
+        fail(f"Cannot migrate safe publish state from {legacy} to {preferred}: {error}")
+    return preferred, state
+
+
+def write_state_atomic(path: Path, state: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        payload = json.dumps(state, ensure_ascii=False, indent=2)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def save_state(path: Path, result: dict) -> bool:
     slug = str(result.get("slug") or "")
     edit_token = str(result.get("editToken") or "")
-    if not slug:
+    current_revision = result.get("currentRevision")
+    if not slug or not isinstance(current_revision, int) or current_revision <= 0:
         return False
     if not edit_token and not result.get("owned"):
         return False
@@ -748,16 +896,38 @@ def save_state(path: Path, result: dict) -> bool:
         "slug": slug,
         "url": result.get("url"),
         "updatedAt": result.get("updatedAt"),
+        "currentRevision": current_revision,
     }
     if edit_token:
         state["editToken"] = edit_token
     if result.get("owned"):
         state["owned"] = True
-    path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_state_atomic(path, state)
     return True
+
+
+def save_pending_state(path: Path, state: dict, request_id: str, create_token: str = "") -> None:
+    pending = {
+        key: state[key]
+        for key in ("slug", "editToken", "owned", "currentRevision")
+        if state.get(key) is not None
+    }
+    pending["pendingRequestId"] = request_id
+    if create_token:
+        pending["createToken"] = create_token
+    write_state_atomic(path, pending)
+
+
+def clear_pending_state(path: Path, state: dict) -> None:
+    cleaned = {
+        key: state[key]
+        for key in ("slug", "editToken", "owned", "currentRevision")
+        if state.get(key) is not None
+    }
+    if cleaned:
+        write_state_atomic(path, cleaned)
+    elif path.exists():
+        path.unlink()
 
 
 def project_arg_to_slug(value: str) -> str:
@@ -784,10 +954,11 @@ def source_endpoint_for_slug(slug: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(path=source_path, params="", query="", fragment=""))
 
 
-def fetch_source_manifest(slug: str, publish_token: str) -> dict:
-    if not publish_token:
-        fail("Restoring an existing project needs --publish-token.")
-    payload = json.dumps({"publishToken": publish_token}, ensure_ascii=False).encode("utf-8")
+def fetch_source_manifest(slug: str, publish_token: str = "", edit_token: str = "") -> dict:
+    if bool(publish_token) == bool(edit_token):
+        fail("Restoring an existing project needs exactly one saved edit token or --publish-token.")
+    credential = {"publishToken": publish_token} if publish_token else {"editToken": edit_token}
+    payload = json.dumps(credential, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         source_endpoint_for_slug(slug),
         data=payload,
@@ -795,11 +966,12 @@ def fetch_source_manifest(slug: str, publish_token: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as res:
             body = res.read().decode("utf-8")
             data = json.loads(body)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        data = {}
         try:
             data = json.loads(body)
             message = data.get("error") or body
@@ -813,6 +985,8 @@ def fetch_source_manifest(slug: str, publish_token: str) -> dict:
 
     if not data.get("ok") or data.get("sourceManifest") != "wai-school-project-v1":
         fail("WAI School source server did not return a valid project manifest")
+    if not isinstance(data.get("revision"), int) or data["revision"] <= 0:
+        fail("WAI School source server did not return a valid project revision")
     return data
 
 
@@ -907,9 +1081,16 @@ def prepare_manifest_files(manifest: dict) -> tuple[list[tuple[str, bytes]], int
     return restored, total_bytes
 
 
-def restore_project_source(slug: str, project_url: str, publish_token: str, target: Path, force: bool = False) -> dict:
+def restore_project_source(
+    slug: str,
+    project_url: str,
+    publish_token: str,
+    target: Path,
+    force: bool = False,
+    edit_token: str = "",
+) -> dict:
     validate_restore_target(target, force)
-    manifest = fetch_source_manifest(slug, publish_token)
+    manifest = fetch_source_manifest(slug, publish_token, edit_token)
     restored, total_bytes = prepare_manifest_files(manifest)
     target.mkdir(parents=True, exist_ok=True)
     if force:
@@ -922,20 +1103,24 @@ def restore_project_source(slug: str, project_url: str, publish_token: str, targ
         out_path.write_bytes(data)
         restored_paths.append(rel)
 
-    save_state(
-        state_path(target),
-        {
-            "slug": slug,
-            "url": project_url,
-            "updatedAt": manifest.get("updatedAt"),
-            "owned": True,
-        },
-    )
+    restored_state = {
+        "slug": slug,
+        "url": project_url,
+        "updatedAt": manifest.get("updatedAt"),
+        "currentRevision": manifest.get("revision"),
+    }
+    if publish_token:
+        restored_state["owned"] = True
+    else:
+        restored_state["editToken"] = edit_token
+    if not save_state(state_path(target), restored_state):
+        fail("WAI School restored the files but could not save a safe update state.")
     return {
         "ok": True,
         "restored": True,
         "slug": slug,
         "title": manifest.get("title") or "Мой проект",
+        "currentRevision": manifest.get("revision"),
         "dir": str(target),
         "fileCount": len(restored_paths),
         "bytes": total_bytes,
@@ -943,13 +1128,37 @@ def restore_project_source(slug: str, project_url: str, publish_token: str, targ
     }
 
 
-def publish(html: str, title: str, state: dict, files: list[dict], publish_token: str = "") -> dict:
+def restore_live_conflict_copy(
+    slug: str,
+    project_url: str,
+    target: Path,
+    revision: int,
+    publish_token: str = "",
+    edit_token: str = "",
+) -> Path:
+    project_root = target if target.is_dir() else target.parent
+    suffix = f"v{revision}" if revision > 0 else "current"
+    live_target = project_root.with_name(f"{project_root.name}-live-{suffix}")
+    restore_project_source(slug, project_url, publish_token, live_target, False, edit_token)
+    return live_target
+
+
+def publish(
+    html: str,
+    title: str,
+    state: dict,
+    files: list[dict],
+    request_id: str,
+    publish_token: str = "",
+    create_token: str = "",
+) -> dict:
     payload_data = {
         "html": html,
         "title": title,
         "files": files,
-        "source": "claude-ai-publisher",
+        "source": "claude-code-publisher",
         "skillVersion": SKILL_VERSION,
+        "clientRequestId": request_id,
     }
     if publish_token:
         payload_data["publishToken"] = publish_token
@@ -957,6 +1166,10 @@ def publish(html: str, title: str, state: dict, files: list[dict], publish_token
         payload_data["slug"] = state["slug"]
     if state.get("editToken"):
         payload_data["editToken"] = state["editToken"]
+    if state.get("currentRevision"):
+        payload_data["baseRevision"] = state["currentRevision"]
+    if create_token:
+        payload_data["createToken"] = create_token
 
     payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -966,11 +1179,12 @@ def publish(html: str, title: str, state: dict, files: list[dict], publish_token
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as res:
             body = res.read().decode("utf-8")
             return json.loads(body)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        data = {}
         try:
             data = json.loads(body)
             message = data.get("error") or body
@@ -981,7 +1195,7 @@ def publish(html: str, title: str, state: dict, files: list[dict], publish_token
                 "Claude code environment cannot reach wai.school. "
                 "Ask a mentor to allow wai.school network access or publish through the WAI School page."
             )
-        fail(f"Server rejected publish ({e.code}): {message}")
+        raise ProjectPublishHttpError(e.code, str(data.get("code") or "publish_rejected"), str(message), data)
     except urllib.error.URLError as e:
         message = str(e.reason if hasattr(e, "reason") else e)
         if re.search(r"host.*not.*allow|allowlist|egress|blocked|name or service not known", message, re.I):
@@ -997,6 +1211,7 @@ def main() -> None:
     parser.add_argument("--dir", default=".", help="Project folder or HTML file to publish")
     parser.add_argument("--publish-token", default="", help="Scoped WAI School child publish token")
     parser.add_argument("--project", default="", help="Existing wai.school/project/... URL or slug to update with a publish token")
+    parser.add_argument("--base-revision", type=int, default=0, help="Known current revision of an existing project")
     parser.add_argument("--expect-url", default="", help="Fail unless the server returns this exact public project URL")
     parser.add_argument("--require-updated", action="store_true", help="Fail unless the server confirms updated: true")
     parser.add_argument("--restore", action="store_true", help="Restore an existing owned project into --dir before editing")
@@ -1013,7 +1228,16 @@ def main() -> None:
     if args.restore:
         if not explicit_slug:
             fail("Restoring a project needs --project with a wai.school/project/... URL or slug.")
-        result = restore_project_source(explicit_slug, args.project or explicit_slug, publish_token, target, args.force)
+        restore_state = load_state(state_path(target)) if target.exists() else {}
+        edit_token = str(restore_state.get("editToken") or "") if restore_state.get("slug") == explicit_slug else ""
+        result = restore_project_source(
+            explicit_slug,
+            args.project or f"https://wai.school/project/{explicit_slug}",
+            publish_token,
+            target,
+            args.force,
+            edit_token,
+        )
         print(json.dumps(result, ensure_ascii=False))
         return
 
@@ -1021,13 +1245,16 @@ def main() -> None:
         fail(f"Path does not exist: {target}")
 
     html, title, warnings, files = bundle_project(target)
-    state_file = state_path(target)
-    state = load_state(state_file)
+    state_file, state = load_project_state(target)
     if explicit_slug:
         if state.get("slug") != explicit_slug:
             state = {"slug": explicit_slug}
         else:
             state["slug"] = explicit_slug
+    if args.base_revision:
+        if args.base_revision <= 0:
+            fail("--base-revision must be a positive integer")
+        state["currentRevision"] = args.base_revision
     if args.dry_run:
         print(
             json.dumps(
@@ -1039,6 +1266,7 @@ def main() -> None:
                     "fileBytes": sum(int(file.get("byteLength") or 0) for file in files),
                     "warnings": warnings,
                     "knownProject": state.get("slug"),
+                    "knownRevision": state.get("currentRevision"),
                     "hasPublishToken": bool(publish_token),
                 },
                 ensure_ascii=False,
@@ -1047,15 +1275,68 @@ def main() -> None:
         return
     if state.get("slug") and not state.get("editToken") and not publish_token:
         fail("Updating an existing project by slug needs --publish-token or a saved edit token.")
+    if state.get("slug") and not state.get("currentRevision"):
+        live_target = restore_live_conflict_copy(
+            state["slug"],
+            args.project or f"https://wai.school/project/{state['slug']}",
+            target,
+            0,
+            publish_token,
+            str(state.get("editToken") or ""),
+        )
+        fail(
+            f"This project state predates safe versions. The current live source was restored to {live_target}. "
+            "Compare it with your working folder, merge the intended changes there, and publish that restored folder."
+        )
 
-    result = publish(html, title, state, files, publish_token)
+    request_id = str(state.get("pendingRequestId") or uuid.uuid4())
+    create_token = ""
+    if not state.get("slug"):
+        create_token = str(state.get("createToken") or uuid.uuid4().hex)
+    try:
+        save_pending_state(state_file, state, request_id, create_token)
+    except OSError as error:
+        fail(f"Cannot save safe publish state at {state_file}: {error}")
+    try:
+        result = publish(html, title, state, files, request_id, publish_token, create_token)
+    except ProjectPublishHttpError as error:
+        if error.code == "project_request_reused":
+            clear_pending_state(state_file, state)
+        if error.code == "project_revision_conflict":
+            clear_pending_state(state_file, state)
+            revision = error.data.get("currentRevision")
+            if isinstance(revision, int) and revision > 0:
+                live_target = restore_live_conflict_copy(
+                    state["slug"],
+                    args.project or f"https://wai.school/project/{state['slug']}",
+                    target,
+                    revision,
+                    publish_token,
+                    str(state.get("editToken") or ""),
+                )
+                fail(
+                    f"Server rejected publish ({error.status}): {error.message} "
+                    f"The live version {revision} was restored to {live_target}. Compare, merge, and publish that folder."
+                )
+        fail(f"Server rejected publish ({error.status}): {error.message}")
     if result.get("ok"):
         if expected_url and result.get("url") != expected_url:
             fail(f"Publish returned a different URL; expected {expected_url}, got {result.get('url') or ''}")
         if args.require_updated and result.get("updated") is not True:
             fail("Publish did not update an existing project; expected updated: true")
-        if save_state(state_file, result):
-            result["projectStateSaved"] = True
+        try:
+            state_saved = save_state(state_file, result)
+        except OSError as error:
+            fail(
+                f"Project published at {result.get('url') or 'an unknown URL'}, but its update state could not be saved at "
+                f"{state_file}: {error}. Fix access to this file and run the same command again."
+            )
+        if not state_saved:
+            fail(
+                f"Project published at {result.get('url') or 'an unknown URL'}, but the server response did not contain "
+                "a safe update token or revision. Run the same command again; do not create another project."
+            )
+        result["projectStateSaved"] = True
         if result.get("editToken"):
             del result["editToken"]
     result["warnings"] = warnings
