@@ -1,122 +1,123 @@
 ---
 name: wai-school-publish
-description: Publish a student's static browser project to wai.school and return a real wai.school/project/... link. Use when the user asks to publish, upload, deploy, share, get a link, or put an HTML/CSS/JS project on WAI School.
+description: Публикация детского статичного HTML/CSS/JS проекта на wai.school со стабильной ссылкой wai.school/project/... Use when the user asks to publish, upload, deploy, share or update a project on WAI School — «опубликуй», «выложи», «сделай ссылку», «обнови сайт/игру», «поделиться проектом».
 ---
 
-# WAI School Publish
+# Публикация проекта на WAI School
 
-Use this skill when the student wants to publish, update, upload, deploy, share, or get a public link for an HTML/CSS/JS project.
+Ты работаешь в сессии ребёнка 7–15 лет. Говори на языке ребёнка (по умолчанию — по-русски), простыми словами, один вопрос за раз. Правила из CLAUDE.md ребёнка важнее стилистики этого файла. Технические детали (state-файлы, токены, JSON) ребёнку не показывай и не объясняй.
 
-The installed skill is invoked as `/wai-school-publish`. Its bundled publisher must always be addressed through `${CLAUDE_SKILL_DIR}` so publishing works from any student project folder.
+Задача простая: проверить папку проекта, отправить её на WAI School и вернуть ребёнку настоящую ссылку. Если проект из этой папки уже публиковался — та же команда обновит ту же ссылку.
 
-The goal is simple: bundle the current project, upload it to WAI School, and return the real link. If the project was already published from this folder, publish again to create the next version on the same link. Do not invent links.
+## Шаг 1 — найди publisher и Python (один раз за сессию)
 
-## What To Do
+Publisher — это скрипт `publish_project.py`. Ищи его по порядку, бери первый существующий:
 
-1. Identify the project folder.
-   - If the user attached or created a single `.html` file, use that file.
-   - If the current workspace has `index.html`, use the current workspace.
-   - If `package.json` defines a `build` script, run that existing script with the project's current lockfile package manager before validation (`pnpm build`, `npm run build`, `yarn build`, or `bun run build`). If the build fails, surface the exact failure; do not guess another command or publish stale source files.
-   - The publisher automatically selects exactly one ready `dist/`, `build/`, `out/`, or `public/` root and uploads only files inside it. If it reports several ready builds, ask which build folder to publish and pass that folder explicitly.
-   - The static build must use relative local asset paths such as `./assets/app.js`, because the project lives below `/project/<slug>/`. If dry-run reports `Use relative paths`, set the framework's public/base path to a relative value, rebuild, and rerun dry-run; do not patch hashed build files as a hidden workaround.
-   - If the project exists only as code in the chat, first save it as one local `.html` file, then publish that file.
-   - If there are several folders, ask one short question: which folder should be published?
-   - Local CSS, JS, images, audio, video, JSON levels, fonts, GLB/GLTF models, and WASM are allowed; the publisher uploads supported local files with the project.
-   - Keep the project compact: up to 400 files, 10 MB per file, 50 MB total local files.
+1. `~/.claude/skills/wai-school-publish/scripts/publish_project.py`
+2. `${CLAUDE_SKILL_DIR}/scripts/publish_project.py`
+3. Нет ни там, ни там — скачай: `curl -fsSL https://wai.school/tools/wai-school-publish.py -o wai-school-publish.py` (зеркало: `https://raw.githubusercontent.com/mikwiseman/wai-school-publish-skill/main/wai-school-publish/scripts/publish_project.py`)
 
-2. Run a local validation first:
+Python ищи одной командой (на Windows команда `python3` часто только открывает Microsoft Store — поэтому проверяем запуском, а не наличием):
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --dry-run --dir .
+for c in "python3" "python" "py -3"; do $c -c "print('PYOK')" >/dev/null 2>&1 && { echo "$c"; break; }; done
 ```
 
-If the project is a file or subfolder, pass that path:
+Команда ничего не напечатала — Python нет. Тогда сразу иди в раздел «Запасной путь без Python» — это не ошибка и не тупик.
+
+Дальше `<PY>` — найденная команда Python, `<SCRIPT>` — найденный путь к publisher.
+
+## Шаг 2 — проверь проект (dry-run)
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --dry-run --dir ./my-project
+<PY> <SCRIPT> --dry-run --dir <папка-или-файл-проекта>
 ```
 
-3. If validation succeeds, publish:
+- Если у проекта есть `package.json` со скриптом `build` — сначала запусти сборку тем пакетным менеджером, чей lock-файл лежит в папке, и публикуй результат. Ошибку сборки покажи как есть.
+- `warnings` в ответе — не ошибки. Служебные файлы (CLAUDE.md, PROJECT.md, черновики, старые версии страниц) publisher сам пропускает и не публикует.
+- `"ok": false` — читай поле `fix`: там по-русски написано, что исправить. Исправь и повтори dry-run. Если правка меняет то, что ребёнок не просил менять (например, заменить localStorage или alert), — сначала объясни одной фразой, почему без этого ссылка не заработает, и спроси разрешения одним вопросом.
+
+## Шаг 3 — опубликуй
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --dir .
+<PY> <SCRIPT> --dir <папка-или-файл-проекта>
 ```
 
-If the student is continuing an existing WAI School project from a new chat, pass the existing public link:
+- `"ok": true` — скажи ребёнку ссылку из поля `url` (точно как в JSON, не выдумывай).
+- `"updated": true` — скажи, что обновилась та же ссылка.
+- `"redacted": true` — скажи, что сервер убрал личные данные, пусть проверит страницу.
+- В ответе есть `warnings` от сервера — это идеи на следующую версию. После публикации предложи ребёнку самое интересное из них одним коротким вопросом.
+- Публикация прошла — ссылка готова. Ничего не «улучшай» перед публикацией без просьбы ребёнка: сначала живая ссылка, потом улучшения.
+
+Если в чате ребёнку выдан личный `publish-token` — добавляй его к каждой команде публикации: `--publish-token <токен>`. Токен не показывай, не сохраняй в файлы и не повторяй в ответах. С токеном проект сам появляется в «Моих проектах» ребёнка на wai.school (в JSON будет `"owned": true` — скажи об этом одной строкой).
+
+## Обновление той же ссылки
+
+Запускай те же команды из той же папки — publisher помнит проект через свой скрытый файл `.wai-school-project.json` (не удаляй его, не переименовывай, ребёнку про него не рассказывай). Для строгой проверки обновления:
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --restore --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --dry-run --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --project https://wai.school/project/... --publish-token <token> --dir ./wai-school-project
+<PY> <SCRIPT> --project <живая-ссылка> --expect-url <живая-ссылка> --require-updated --dir <папка>
 ```
 
-The restore stores the current revision locally. Every later publish sends that revision, so two Claude chats cannot silently overwrite each other.
+Никогда не говори «обновил ту же ссылку», если в JSON нет `"updated": true` или url изменился.
 
-The publisher treats its local project state as an update capability: it writes it atomically with owner-only permissions and stops on corrupt or incomplete state instead of creating a duplicate project. Separate non-index HTML files in one folder receive separate state files; an ambiguous legacy folder must be split or checked by a mentor before publishing.
+## Продолжение проекта в новом чате
 
-If the prompt includes a scoped `publish-token`, pass it as a CLI argument. Never save it in project files or repeat it to the student:
+Если ребёнок продолжает опубликованный проект, а папки с ним нет:
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/publish_project.py --project https://wai.school/project/... --publish-token <token> --dir .
+<PY> <SCRIPT> --restore --project <живая-ссылка> --publish-token <токен> --dir ./wai-school-project
 ```
 
-4. Read the script output.
-   - If it returns `ok: true`, tell the student the exact `url`.
-   - If it returns `updated: true`, say that the same link was updated.
-   - If it says `Missing local project file`, create or fix the referenced local file/path, rerun `--dry-run`, then publish.
-   - If it returns a validation error, explain it in plain words and suggest one small fix.
-   - If it returns a server, network, or token error, tell the student: "Не получилось опубликовать автоматически. Позови ментора." Keep the exact error for the mentor.
-   - If it reports a revision conflict, do not overwrite immediately. The current publisher restores the live project into a separate `*-live-vN` folder automatically. Compare that folder with the student's current files, merge the intended change into the restored folder, run dry-run, and publish from that restored folder. The current public version and the student's local work must both be preserved.
-   - If it reports a corrupt, incomplete, or ambiguous safe publish state, stop. Do not delete the state or publish as a new project. Ask a mentor to repair the state or identify the correct live project first.
-   - A legacy anonymous project state without a revision is handled the same way: its saved edit capability restores the current source into `*-live-current` and stops before publishing. Never bypass that stop with a guessed revision.
-   - Never claim the project was published unless the script returned a URL.
+Restore скачает точные исходники живой версии и сохранит безопасное состояние обновления. Дальше — обычные шаги 2–3 из этой папки.
 
-The server keeps the latest 20 quick-publish versions. A child can inspect them, download the exact multi-file sources, or restore an older version from “Мои проекты”. Restoring never erases history: it creates a new current revision on the same public link.
+## Если ошибка
 
-## Output Style
+1. Прочитай `fix` в JSON и сделай ровно это. Максимум две попытки исправления — без случайных перестановок.
+2. `конфликт версий` (проект обновили в другом окне): publisher сам скачает живую версию в соседнюю папку `*-live-vN` и остановится. Сравни её с папкой ребёнка, перенеси нужные изменения в восстановленную папку и публикуй из неё. Ничего не перезаписывай вслепую и не подставляй `--base-revision` наугад.
+3. Повреждённый state / «project state predates safe versions» — остановись и позови ментора; не публикуй проект как новый.
+4. Сервер недоступен или сеть запрещена — «Запасной путь без Python» ниже работает и без скрипта.
+5. Ничего не помогло — покажи ребёнку короткое «Позови ментора, я сохранил точную ошибку», а точный JSON ошибки держи готовым для ментора.
 
-Use Russian by default.
+## Запасной путь без Python (через браузер)
 
-Keep the final answer short:
+Работает на любом компьютере, ничего не нужно устанавливать:
+
+1. Скажи ребёнку: «Открой в браузере wai.school/student и войди по своей ссылке».
+2. «Нажми "Мои проекты" → "Опубликовать проект"».
+3. «Выбери папку проекта: <точный полный путь к папке>» (назови путь; лишние файлы страница пропустит сама и покажет подсказки).
+4. Страница проверит проект и даст ту же ссылку wai.school/project/...
+5. Не получилось — позови ментора.
+
+## Правила (коротко)
+
+- Не публикуй `.env`, ключи, пароли, backend-код — publisher сам их не пропустит, но и ты не обходи его проверки.
+- Только статичные проекты: HTML, CSS, JS, картинки, звук, видео, шрифты, JSON, GLB/GLTF, WASM. Всё — локальными файлами внутри папки, без CDN и внешних ссылок.
+- Не используй другой хостинг (GitHub Pages, Vercel, Artifacts и т.п.) и не придумывай ссылки. Единственный адрес проекта — тот, что вернул publisher или страница WAI School.
+- Не утверждай, что проект опубликован, пока не увидел `"ok": true` и `url`.
+
+## Что сказать ребёнку (шаблоны)
 
 ```text
 Готово, проект опубликован:
 https://wai.school/project/...
 
-Открой ссылку и проверь, что всё выглядит как нужно.
+Открой ссылку и проверь, что всё работает как ты хочешь.
 ```
-
-When updating an existing link:
 
 ```text
 Готово, я обновил ту же ссылку:
 https://wai.school/project/...
 
-Открой и проверь новую версию.
+Открой её и посмотри новую версию.
 ```
 
-If the server says it redacted personal data, mention it briefly:
+## Для ментора: быстрая диагностика
 
-```text
-Сервер убрал личные данные перед публикацией. Проверь страницу по ссылке.
+Если публикация не работает и непонятно почему — попроси Claude выполнить:
+
+```bash
+<PY> <SCRIPT> --doctor --dir <папка-проекта>
 ```
 
-If Claude's code environment cannot reach `wai.school`, say this exactly and stop:
-
-```text
-Не получилось опубликовать автоматически: Claude сейчас не может подключиться к wai.school.
-Позови ментора: нужно разрешить доступ к wai.school или опубликовать через страницу WAI School.
-```
-
-## Rules
-
-- Do not upload `.env`, API keys, tokens, passwords, private keys, or backend source code.
-- Publish only static student projects: HTML, CSS, JS, images, audio, video, fonts, JSON, GLB/GLTF, and WASM.
-- Keep everything local inside the project folder: no CDN, external API calls, WebSocket/EventSource, service workers, cookies, localStorage, sessionStorage, IndexedDB, or Cache API.
-- Use a clean project folder so unrelated local files are not uploaded by mistake.
-- If there is no HTML file, create one from the project code or ask one short question.
-- Do not use another hosting service.
-- Do not make up a `wai.school` URL.
-- Do not keep retrying with random changes. Surface the server error.
-- Do not bypass a revision conflict with a guessed `--base-revision`. Use it only after checking that exact live revision and intentionally merging the files.
-- Keep `.wai-school-project.json` private and do not explain it to the student unless a mentor asks.
+Доктор по-русски покажет: какой Python найден, где лежит publisher, есть ли у папки сохранённая ссылка и отвечает ли сервер wai.school. Этот вывод можно целиком переслать в чат школы.

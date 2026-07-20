@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Publish a static HTML project and local assets to wai.school.
 
-No third-party dependencies: this script is meant to run inside Claude Code
-execution after the WAI School Publish skill is installed.
+No third-party dependencies. Runs on Python 3.8+ (python3, python, or `py -3`
+on Windows). Blocking checks mirror the wai.school server; everything else is
+a warning, so a normal child project publishes on the first try.
+
+Every failure JSON has two fields: "error" (English, for logs and mentors)
+and "fix" (Russian, the one action that repairs it — Claude reads this aloud).
 """
 
 from __future__ import annotations
@@ -24,8 +28,7 @@ import uuid
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-07-15.3"
-MAX_INLINE_ASSET_BYTES = 2_000_000
+SKILL_VERSION = "2026-07-20.1"
 MAX_PROJECT_FILES = 400
 MAX_PROJECT_FILE_BYTES = 10_000_000
 MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
@@ -33,60 +36,12 @@ NETWORK_TIMEOUT_SECONDS = 120
 STATE_FILE_NAME = ".wai-school-project.json"
 
 TEXT_EXTENSIONS = {".html", ".htm", ".css", ".gltf", ".js", ".mjs", ".txt", ".json"}
-VISUAL_ASSET_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
-AUDIO_ASSET_EXTENSIONS = {".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".wav"}
-MODEL_ASSET_EXTENSIONS = {".bin", ".glb", ".gltf", ".wasm"}
 PROJECT_FILE_EXTENSIONS = {
-    ".avif",
-    ".bin",
-    ".bmp",
-    ".css",
-    ".flac",
-    ".gif",
-    ".glb",
-    ".gltf",
-    ".ico",
-    ".jpeg",
-    ".jpg",
-    ".js",
-    ".json",
-    ".m4a",
-    ".mid",
-    ".midi",
-    ".mjs",
-    ".mp3",
-    ".mp4",
-    ".ogg",
-    ".otf",
-    ".png",
-    ".ttf",
-    ".txt",
-    ".wav",
-    ".webm",
-    ".webmanifest",
-    ".webp",
-    ".woff",
-    ".woff2",
-    ".wasm",
+    ".avif", ".bin", ".bmp", ".css", ".flac", ".gif", ".glb", ".gltf", ".ico",
+    ".jpeg", ".jpg", ".js", ".json", ".m4a", ".mid", ".midi", ".mjs", ".mp3",
+    ".mp4", ".ogg", ".otf", ".png", ".ttf", ".txt", ".wav", ".webm",
+    ".webmanifest", ".webp", ".woff", ".woff2", ".wasm",
 }
-INLINE_ASSET_EXTENSIONS = (
-    "png",
-    "jpe?g",
-    "gif",
-    "webp",
-    "avif",
-    "bmp",
-    "flac",
-    "mid",
-    "midi",
-    "mp3",
-    "wav",
-    "ogg",
-    "m4a",
-    "woff2?",
-    "ttf",
-    "otf",
-)
 IGNORED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build"}
 READY_BUILD_DIRS = {"dist", "build", "out", "public"}
 ENTRY_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".next"}
@@ -97,15 +52,9 @@ SECRET_PATTERNS = [
     re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*[\"'][^\"']{8,}[\"']", re.I),
     re.compile(r"\b(?:OPENAI|ANTHROPIC|GEMINI|NOTION|RESEND|WAIPAY)_[A-Z0-9_]*\s*[:=]", re.I),
 ]
-FORBIDDEN_RUNTIME_ERROR = (
-    "Project quality check failed: external network, external assets, browser storage, "
-    "service workers, cookies, IndexedDB, and Cache API are not allowed. "
-    "Keep every asset local inside the project folder."
-)
-FORBIDDEN_DIALOG_ERROR = (
-    "Project quality check failed: browser modal dialogs are not allowed. "
-    "Use visible on-page feedback instead."
-)
+
+# Platform bans, kept byte-identical to the wai.school server checks: published
+# projects run in a sandboxed iframe where these APIs are blocked at runtime.
 FORBIDDEN_RUNTIME_PATTERNS = [
     re.compile(r"\b(?:src|srcset|href|poster|action)\s*=\s*[\"']?\s*(?:https?:)?//", re.I),
     re.compile(r"\burl\(\s*[\"']?\s*(?:https?:)?//", re.I),
@@ -116,94 +65,51 @@ FORBIDDEN_RUNTIME_PATTERNS = [
     re.compile(r"\bnew\s+(?:WebSocket|EventSource)\s*\(\s*['\"`]\s*(?:wss?:|https?:)?//", re.I),
     re.compile(r"\bnavigator\.sendBeacon\s*\(\s*['\"`]\s*(?:https?:)?//", re.I),
     re.compile(r"\bXMLHttpRequest\b[\s\S]{0,800}\.open\s*\(\s*['\"`][A-Z]+['\"`]\s*,\s*['\"`]\s*(?:https?:)?//", re.I),
-    re.compile(r"\b(?:localStorage|sessionStorage|indexedDB|document\.cookie|navigator\.serviceWorker|caches)\b", re.I),
 ]
+FORBIDDEN_STORAGE_RE = re.compile(r"\b(?:localStorage|sessionStorage|indexedDB|document\.cookie|navigator\.serviceWorker|caches)\b", re.I)
 FORBIDDEN_DIALOG_RE = re.compile(r"\b(?:alert|confirm|prompt)\s*\(", re.I)
-HTML_LOCAL_REF_RE = re.compile(
-    r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(?:(['"])(?P<quoted>[^'"]+)\1|(?P<unquoted>[^\s"'=<>`]+))""",
+
+RUNTIME_FIX_RU = (
+    "Проект на wai.school живёт в защищённой рамке без доступа к внешней сети. "
+    "Сохрани нужный файл (картинку, скрипт, шрифт) внутрь папки проекта и подключи его относительным путём вида ./assets/имя."
+)
+STORAGE_FIX_RU = (
+    "localStorage, sessionStorage, cookie и indexedDB не работают в опубликованном проекте (защищённая рамка). "
+    "Храни данные в обычной переменной JavaScript — сохранение между визитами на wai.school пока не поддерживается."
+)
+DIALOG_FIX_RU = (
+    "alert, confirm и prompt не работают в опубликованном проекте. "
+    "Замени их на сообщение прямо на странице: например, div с текстом, который появляется и исчезает."
+)
+NETWORK_FIX_RU = (
+    "Не получилось соединиться с wai.school. Проверь интернет и запусти команду ещё раз. "
+    "Если Claude пишет, что сеть запрещена настройками, — публикуй через браузер: wai.school/student → «Мои проекты»."
+)
+
+HTML_QUOTED_REF_RE = re.compile(
+    r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(['"])(?P<url>[^'"]+)\1""",
     re.I,
 )
 CSS_URL_RE = re.compile(r"""url\(\s*(?P<quote>['"]?)(?P<url>[^)'"]+)(?P=quote)\s*\)""", re.I)
-SCRIPT_BLOCK_RE = re.compile(r"""<script\b[^>]*>(?P<js>[\s\S]*?)</script>""", re.I)
-STYLE_BLOCK_RE = re.compile(r"""<style\b[^>]*>(?P<css>[\s\S]*?)</style>""", re.I)
-HTML_TAG_RE = re.compile(r"""<[^>]+>""")
-JS_LOCAL_REF_PATTERNS = [
+GLTF_URI_RE = re.compile(r"""["']uri["']\s*:\s*["'](?P<url>[^"']+)["']""", re.I)
+# Broad JS patterns are used only to COLLECT extra files for upload (a found
+# file always exists); they are never used to fail a publish.
+JS_COLLECT_PATTERNS = [
     re.compile(r"""\bfetch\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
     re.compile(r"""\bimport\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*\)"""),
     re.compile(r"""\bnew\s+URL\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*,"""),
     re.compile(r"""\b(?:import|export)\s+(?:[^'"]+\s+from\s+)?(['"])(?P<url>[^'"]+)\1"""),
-    re.compile(r"""\bnew\s+(?:Worker|SharedWorker)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
-    re.compile(r"""\bnew\s+(?:Audio|Image)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
+    re.compile(r"""\bnew\s+(?:Worker|SharedWorker|Audio|Image)\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
     re.compile(r"""\b(?:src|href)\s*=\s*(['"`])(?P<url>[^'"`]+)\1"""),
     re.compile(r"""\bsetAttribute\s*\(\s*['"](?:src|href|poster)['"]\s*,\s*(['"`])(?P<url>[^'"`]+)\1"""),
 ]
-GLTF_URI_RE = re.compile(r"""["']uri["']\s*:\s*["'](?P<url>[^"']+)["']""", re.I)
-ACTION_SIGNAL_RE = re.compile(
-    r"""\b(addEventListener|onclick|onpointer|onmouse|ontouch|onkey|onsubmit|onchange)\b|<\s*(button|input|select|textarea)\b""",
-    re.I,
-)
-FEEDBACK_SIGNAL_RE = re.compile(
-    r"""\b(textContent|innerHTML|classList|dataset|setAttribute|appendChild|requestAnimationFrame|score|state|result|progress|level|energy|impact|meter|win|won|lose|lost)\b""",
-    re.I,
-)
-VISUAL_SIGNAL_RE = re.compile(
-    r"""<\s*canvas\b|\b(radial-gradient|linear-gradient|animation|transition|transform|box-shadow|grid|scene|card|panel|choice|preview|particles?)\b""",
-    re.I,
-)
-GAME_SIGNAL_RE = re.compile(
-    r"""<\s*canvas\b|\b(player|enemy|enemies|boss|collision|particle|sprite|tilemap|physics|keydown|keyup|pointerlock)\b""",
-    re.I,
-)
-SPORTS_GAME_SIGNAL_RE = re.compile(
-    r"""\b(soccer|football|goal|goals|ball|keeper|striker|stadium|arena|match|scoreboard|field|monster soccer|футбол|гол|мяч|ворот|вратар|стадион|арен|матч|табло|поле)\b""",
-    re.I,
-)
-GAME_INPUT_RE = re.compile(r"""\b(keydown|keyup|pointer|mousemove|touch|click|addEventListener)\b""", re.I)
-GOAL_SIGNAL_RE = re.compile(
-    r"""\b(goal|mission|target|collect|find|escape|open|finish|objective|quest|keys?|cores?|coins?|цель|миссия|собери|найди|побед|выход)\b""",
-    re.I,
-)
-RISK_SIGNAL_RE = re.compile(
-    r"""\b(risk|danger|enemy|hazard|trap|boss|guard|damage|health|energy|timer|timeLeft|lives|lose|lost|опасн|враг|ловуш|босс|охран|урон|жизн|таймер|проигр)\b""",
-    re.I,
-)
-PROGRESS_SIGNAL_RE = re.compile(
-    r"""<\s*progress\b|\b(progress|level|stage|scene|score|combo|meter|energy|inventory|unlock|phase|state|result|impact|уров|сч[её]т|прогресс|результат|этап|режим)\b""",
-    re.I,
-)
-END_STATE_SIGNAL_RE = re.compile(
-    r"""\b(win|won|lose|lost|complete|completed|finish|final|ending|result|success|fail|game over|try again|restart|побед|финал|конец|готово|проигр|снова)\b""",
-    re.I,
-)
-EFFECT_SIGNAL_RE = re.compile(
-    r"""\b(requestAnimationFrame|AudioContext|Oscillator|particle|particles|burst|shake|glow|confetti|animation|transition|transform|parallax|trail|sound|audio|свет|звук|частиц)\b""",
-    re.I,
-)
-GAME_PRESENTATION_RE = re.compile(
-    r"""\b(drawImage|createPattern|createLinearGradient|createRadialGradient|shadowBlur|globalCompositeOperation|Path2D|bezierCurveTo|quadraticCurveTo|clip|rotate|scale|translate|camera|viewport|parallax|tilemap|tile|tiles|sprite|spritesheet|atlas|frameIndex|layer|backgroundLayer|foreground|minimap|lighting|screenShake|shake|particle|particles|trail|glow|confetti|texture|biome|prop|props)\b""",
-    re.I,
-)
-GAME_SYSTEM_RE = re.compile(
-    r"""\b(enemy|enemies|drone|drones|guard|hazard|boss|phase|wave|waves|spawn|ai|behavior|patrol|path|pathfinding|cooldown|ability|dash|attack|health|damage|shield|inventory|quest|dialog|cutscene|checkpoint|room|level|stage|unlock|timer|objective|mission|collision|physics|camera|parallax|minimap|gate|core|cores|collectible|relic|energy)\b""",
-    re.I,
-)
-PRIMITIVE_SHAPE_SIGNAL_RE = re.compile(
-    r"""\b(border-radius\s*:\s*(?:50%|999px)|ctx\.arc|\.arc\s*\(|drawMonster|drawCircle|circle|ellipse|rounded-full|прост(?:ые|ыми)\s+фигур)\b""",
-    re.I,
-)
-SPORTS_ARENA_RE = re.compile(
-    r"""\b(stadium|crowd|stands|keeper phases?|goal replay|replay|confetti|charged shots?|ball physics|goal net|announcer|scoreboard pulse|goal camera|slow motion|стадион|трибун|толп|репле[йя]|конфетти|заряженн|физик[аи]\s+мяч|сетка|табло)\b""",
-    re.I,
-)
-MULTIFILE_SIGNAL_RE = re.compile(
-    r"""\b(levels?/|data/|assets?/|fetch\s*\(\s*['"`][^'"`]+\.json|import\s+|export\s+|class\s+\w+)\b""",
-    re.I,
-)
-CHOICE_SIGNAL_RE = re.compile(r"""\b(choice|choices|selected|option|quiz|question|answer|card|reveal|filter|выбор|вариант|вопрос|ответ|карточ)\b""", re.I)
 
 
-def fail(message: str, code: int = 1) -> None:
-    print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+def fail(message: str, fix: str = "", code: int = 1) -> None:
+    payload = {"ok": False, "error": message}
+    if fix:
+        payload["fix"] = fix
+    print(json.dumps(payload, ensure_ascii=False))
     raise SystemExit(code)
 
 
@@ -235,18 +141,6 @@ def project_files(root: Path) -> list[Path]:
     return out
 
 
-def scan_for_secrets(root: Path) -> None:
-    for path in project_files(root):
-        if path.name.lower() in SECRET_FILE_NAMES:
-            fail(f"Refusing to publish secret-looking file: {path.relative_to(root)}")
-        if path.suffix.lower() not in TEXT_EXTENSIONS:
-            continue
-        text = read_text(path)
-        for pattern in SECRET_PATTERNS:
-            if pattern.search(text):
-                fail(f"Refusing to publish because {path.relative_to(root)} appears to contain a secret")
-
-
 def ready_build_indexes(root: Path) -> list[Path]:
     indexes: list[Path] = []
     for dirpath, dirnames, _filenames in os.walk(root):
@@ -266,18 +160,13 @@ def ready_build_indexes(root: Path) -> list[Path]:
     return sorted(indexes)
 
 
-def validate_no_forbidden_runtime(text: str) -> None:
-    if FORBIDDEN_DIALOG_RE.search(text):
-        fail(FORBIDDEN_DIALOG_ERROR)
-    for pattern in FORBIDDEN_RUNTIME_PATTERNS:
-        if pattern.search(text):
-            fail(FORBIDDEN_RUNTIME_ERROR)
-
-
 def choose_html(root: Path) -> Path:
     if root.is_file():
         if root.suffix.lower() not in {".html", ".htm"}:
-            fail("The selected file is not HTML. Create or select index.html first.")
+            fail(
+                "The selected file is not HTML.",
+                "Выбери HTML-файл проекта или папку, где лежит index.html.",
+            )
         return root
 
     root_indexes = [candidate for candidate in (root / "index.html", root / "index.htm") if candidate.is_file()]
@@ -287,34 +176,35 @@ def choose_html(root: Path) -> Path:
     if (root / "package.json").is_file() and build_indexes:
         if len(build_indexes) > 1:
             options = ", ".join(path.relative_to(root).as_posix() for path in build_indexes)
-            fail(f"Several ready builds were found: {options}. Select the intended build folder explicitly.")
+            fail(
+                f"Several ready builds were found: {options}.",
+                "Нашлось несколько готовых сборок. Запусти publisher ещё раз, указав --dir на нужную папку сборки.",
+            )
         return build_indexes[0]
     if root_indexes:
         return root_indexes[0]
     if build_indexes:
         if len(build_indexes) > 1:
             options = ", ".join(path.relative_to(root).as_posix() for path in build_indexes)
-            fail(f"Several ready builds were found: {options}. Select the intended build folder explicitly.")
+            fail(
+                f"Several ready builds were found: {options}.",
+                "Нашлось несколько готовых сборок. Запусти publisher ещё раз, указав --dir на нужную папку сборки.",
+            )
         return build_indexes[0]
 
     html_files = sorted([p for p in project_files(root) if p.suffix.lower() in {".html", ".htm"}])
     if not html_files:
-        fail("No HTML file found. Create index.html first, then publish again.")
+        fail(
+            "No HTML file found.",
+            "В папке нет HTML-файла. Создай index.html — главную страницу проекта — и запусти публикацию снова.",
+        )
+    if len(html_files) > 1:
+        options = ", ".join(p.relative_to(root).as_posix() for p in html_files[:6])
+        fail(
+            f"Several HTML files and no index.html: {options}.",
+            "В папке несколько HTML-файлов, и непонятно, какой главный. Переименуй главную страницу в index.html или укажи файл: --dir путь/к/файлу.html.",
+        )
     return html_files[0]
-
-
-def local_asset_path(base: Path, raw_url: str) -> Path | None:
-    if not raw_url or raw_url.startswith(("http://", "https://", "data:", "mailto:", "#", "javascript:")):
-        return None
-    parsed = urllib.parse.urlparse(raw_url)
-    if parsed.scheme or parsed.netloc:
-        return None
-    candidate = (base / urllib.parse.unquote(parsed.path)).resolve()
-    try:
-        candidate.relative_to(base.resolve())
-    except ValueError:
-        return None
-    return candidate if candidate.exists() and candidate.is_file() else None
 
 
 def is_external_or_virtual_ref(raw_url: str) -> bool:
@@ -327,31 +217,6 @@ def is_external_or_virtual_ref(raw_url: str) -> bool:
     ):
         return True
     return False
-
-
-def resolve_local_reference(base: Path, raw_url: str, project_root: Path, source: Path) -> None:
-    value = (raw_url or "").strip()
-    if is_external_or_virtual_ref(value):
-        return
-    if "\0" in value or "${" in value or "{" in value or "}" in value:
-        return
-
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme or parsed.netloc:
-        return
-    ref_path = urllib.parse.unquote(parsed.path or "").strip()
-    if not ref_path:
-        return
-    if ref_path.startswith("/"):
-        fail(f"Use relative paths inside the project; {source.relative_to(project_root)} references {value}")
-
-    candidate = (base / ref_path).resolve()
-    try:
-        candidate.relative_to(project_root.resolve())
-    except ValueError:
-        fail(f"Local project reference escapes the project folder from {source.relative_to(project_root)}: {value}")
-    if not candidate.exists() or not candidate.is_file():
-        fail(f"Missing local project file referenced from {source.relative_to(project_root)}: {value}")
 
 
 def local_reference_candidate(base: Path, raw_url: str, project_root: Path) -> Path | None:
@@ -376,312 +241,97 @@ def local_reference_candidate(base: Path, raw_url: str, project_root: Path) -> P
     return candidate if candidate.exists() and candidate.is_file() else None
 
 
-def html_reference_url(match: re.Match[str]) -> str:
-    return match.group("quoted") or match.group("unquoted") or ""
+def check_quoted_reference(base: Path, raw_url: str, project_root: Path, source: Path) -> None:
+    """Blocking check for explicitly quoted references in HTML and CSS only.
+
+    JS code is never validated here: `img.src = photoMap.preview` is code, not
+    a path, and guessing breaks real projects.
+    """
+    value = (raw_url or "").strip()
+    if not value or value.startswith("#") or value.startswith(("data:", "mailto:", "tel:", "javascript:", "blob:", "about:")):
+        return
+    if value.startswith(("http://", "https://", "//")):
+        fail(
+            f"External reference in {source.relative_to(project_root)}: {value}",
+            RUNTIME_FIX_RU,
+        )
+    if "${" in value or "{" in value or "}" in value or "\0" in value:
+        return
+
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return
+    ref_path = urllib.parse.unquote(parsed.path or "").strip()
+    if not ref_path:
+        return
+    if ref_path.startswith("/"):
+        fail(
+            f"Absolute path in {source.relative_to(project_root)}: {value}",
+            "Используй относительные пути внутри папки проекта: ./style.css, ./assets/hero.png — без начального «/».",
+        )
+    suffix = Path(ref_path).suffix.lower()
+    if not suffix:
+        return
+
+    candidate = (base / ref_path).resolve()
+    try:
+        candidate.relative_to(project_root.resolve())
+    except ValueError:
+        fail(
+            f"Reference escapes the project folder in {source.relative_to(project_root)}: {value}",
+            "Файл лежит за пределами папки проекта. Скопируй его внутрь папки и поправь путь.",
+        )
+    if not candidate.exists() or not candidate.is_file():
+        fail(
+            f"Missing local project file referenced from {source.relative_to(project_root)}: {value}",
+            f"Страница использует файл «{ref_path}», но его нет в папке. Добавь файл или исправь путь.",
+        )
 
 
-def validate_js_references(source: Path, text: str, project_root: Path) -> None:
-    for pattern in JS_LOCAL_REF_PATTERNS:
-        for match in pattern.finditer(text):
-            resolve_local_reference(source.parent, match.group("url"), project_root, source)
-
-
-def validate_local_references(root_or_file: Path, html_path: Path) -> None:
-    project_root = html_path.parent if root_or_file.is_file() else root_or_file
-
-    html = read_text(html_path)
-    for match in HTML_LOCAL_REF_RE.finditer(html):
-        resolve_local_reference(html_path.parent, html_reference_url(match), project_root, html_path)
-    for match in CSS_URL_RE.finditer(html):
-        resolve_local_reference(html_path.parent, match.group("url"), project_root, html_path)
-    validate_js_references(html_path, html, project_root)
-
-    if root_or_file.is_file():
-        referenced: set[Path] = set()
-        collect_referenced_project_files(html_path, project_root, referenced, set())
-        candidate_files = sorted(referenced)
-    else:
-        candidate_files = project_files(project_root)
-
-    for path in candidate_files:
+def validate_quoted_references(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
+    for path in [html_path] + upload_paths:
         suffix = path.suffix.lower()
-        if suffix == ".css":
+        if suffix in {".html", ".htm"}:
+            text = read_text(path)
+            for match in HTML_QUOTED_REF_RE.finditer(text):
+                check_quoted_reference(path.parent, match.group("url"), project_root, path)
+            for match in CSS_URL_RE.finditer(text):
+                check_quoted_reference(path.parent, match.group("url"), project_root, path)
+        elif suffix == ".css":
             text = read_text(path)
             for match in CSS_URL_RE.finditer(text):
-                resolve_local_reference(path.parent, match.group("url"), project_root, path)
-        elif suffix in {".js", ".mjs"}:
-            text = read_text(path)
-            validate_js_references(path, text, project_root)
+                check_quoted_reference(path.parent, match.group("url"), project_root, path)
 
 
-def visible_text_from_html(html: str) -> str:
-    text = SCRIPT_BLOCK_RE.sub(" ", html)
-    text = STYLE_BLOCK_RE.sub(" ", text)
-    text = HTML_TAG_RE.sub(" ", text)
-    text = re.sub(r"&[a-z0-9#]+;", " ", text, flags=re.I)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def project_quality_text(root_or_file: Path, html_path: Path) -> tuple[str, str]:
-    project_root = html_path.parent if root_or_file.is_file() else root_or_file
-    html = read_text(html_path)
-    chunks = [html]
-    if root_or_file.is_file():
-        referenced: set[Path] = set()
-        collect_referenced_project_files(html_path, project_root, referenced, set())
-        candidate_files = sorted(referenced)
-    else:
-        candidate_files = project_files(project_root)
-    for path in candidate_files:
-        if path.resolve() == html_path.resolve():
+def validate_forbidden_runtime(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
+    for path in [html_path] + upload_paths:
+        if path.suffix.lower() not in TEXT_EXTENSIONS:
             continue
-        if path.suffix.lower() in {".css", ".js", ".mjs", ".json", ".txt"}:
-            chunks.append(read_text(path))
-    return html, "\n".join(chunks)
+        text = read_text(path)
+        try:
+            rel = path.relative_to(project_root)
+        except ValueError:
+            rel = path.name
+        if FORBIDDEN_DIALOG_RE.search(text):
+            fail(f"Browser modal dialogs are not allowed ({rel}).", DIALOG_FIX_RU)
+        if FORBIDDEN_STORAGE_RE.search(text):
+            fail(f"Browser storage APIs are not allowed ({rel}).", STORAGE_FIX_RU)
+        for pattern in FORBIDDEN_RUNTIME_PATTERNS:
+            if pattern.search(text):
+                fail(f"External network or external assets are not allowed ({rel}).", RUNTIME_FIX_RU)
 
 
-def unique_signal_count(pattern: re.Pattern[str], text: str) -> int:
-    return len({match.group(0).lower() for match in pattern.finditer(text)})
-
-
-def project_asset_counts(root_or_file: Path, html_path: Path) -> dict[str, int]:
-    project_root = html_path.parent if root_or_file.is_file() else root_or_file
-    referenced: set[Path] = set()
-    collect_referenced_project_files(html_path, project_root, referenced, set())
-    candidate_files = sorted(referenced)
-
-    counts = {"visual": 0, "audio": 0, "model": 0}
-    for path in candidate_files:
-        suffix = path.suffix.lower()
-        if suffix in VISUAL_ASSET_EXTENSIONS:
-            counts["visual"] += 1
-        elif suffix in AUDIO_ASSET_EXTENSIONS:
-            counts["audio"] += 1
-        elif suffix in MODEL_ASSET_EXTENSIONS:
-            counts["model"] += 1
-    return counts
-
-
-def validate_project_quality(root_or_file: Path, html_path: Path) -> None:
-    html, all_text = project_quality_text(root_or_file, html_path)
-    asset_counts = project_asset_counts(root_or_file, html_path)
-    validate_no_forbidden_runtime(all_text)
-    visible_text = visible_text_from_html(html)
-    has_canvas = bool(re.search(r"<\s*canvas\b", html, flags=re.I))
-    has_action = bool(ACTION_SIGNAL_RE.search(all_text))
-    has_feedback = bool(FEEDBACK_SIGNAL_RE.search(all_text))
-    has_visual = bool(VISUAL_SIGNAL_RE.search(all_text))
-    looks_like_game = bool(GAME_SIGNAL_RE.search(all_text))
-    looks_like_sports_game = bool(SPORTS_GAME_SIGNAL_RE.search(all_text)) and (
-        looks_like_game or has_canvas or "requestAnimationFrame" in all_text
-    )
-    weak_alert_demo = bool(re.search(r"\balert\s*\(", all_text)) and not (
-        re.search(r"\b(textContent|innerHTML|classList|requestAnimationFrame)\b", all_text)
-    )
-    score_only_demo = bool(re.search(r"\b(score|points?|сч[её]т|очки)\b", all_text, flags=re.I)) and not (
-        GOAL_SIGNAL_RE.search(all_text) or RISK_SIGNAL_RE.search(all_text) or END_STATE_SIGNAL_RE.search(all_text)
-    )
-
-    if len(visible_text) < 24 and not has_canvas:
-        fail("Project quality check failed: add a real first screen with clear text, action, and result before publishing.")
-    if weak_alert_demo:
-        fail("Project quality check failed: replace alert-only demo with visible on-page feedback before publishing.")
-    if score_only_demo:
-        fail(
-            "Project quality check failed: games need more than a primitive demo. "
-            "Add a goal, risk or challenge, progress/state, effects, and a win/loss/result moment before publishing."
-        )
-    if not has_action:
-        fail("Project quality check failed: add a user action such as a button, click, keyboard, pointer, input, or choice before publishing.")
-    if not has_feedback:
-        fail("Project quality check failed: add visible feedback, state, progress, score, result, or scene change before publishing.")
-    if not has_visual:
-        fail("Project quality check failed: add a stronger visual surface: canvas, scene, cards, panels, grid, animation, transition, or styled result.")
-    if (looks_like_game or has_canvas or looks_like_sports_game) and (has_canvas or "requestAnimationFrame" in all_text):
-        if "requestAnimationFrame" not in all_text:
-            fail("Project quality check failed: canvas games need a requestAnimationFrame game loop before publishing.")
-        if not GAME_INPUT_RE.search(all_text):
-            fail("Project quality check failed: games need keyboard, pointer, click, or touch input before publishing.")
-
-    quality_layers = {
-        "goal": bool(GOAL_SIGNAL_RE.search(all_text)),
-        "risk": bool(RISK_SIGNAL_RE.search(all_text)),
-        "progress": bool(PROGRESS_SIGNAL_RE.search(all_text)),
-        "end": bool(END_STATE_SIGNAL_RE.search(all_text)),
-        "effect": bool(EFFECT_SIGNAL_RE.search(all_text)),
-        "multi_file": bool(MULTIFILE_SIGNAL_RE.search(all_text)),
-        "choice": bool(CHOICE_SIGNAL_RE.search(all_text)),
-    }
-    layer_count = sum(quality_layers.values())
-    if looks_like_game or has_canvas or looks_like_sports_game:
-        if layer_count < 3:
-            fail(
-                "Project quality check failed: games need more than a primitive demo. "
-                "Add a goal, risk or challenge, progress/state, effects, and a win/loss/result moment before publishing."
-            )
-        system_depth = unique_signal_count(GAME_SYSTEM_RE, all_text)
-        presentation_depth = unique_signal_count(GAME_PRESENTATION_RE, all_text)
-        rich_asset_count = asset_counts["visual"] + asset_counts["audio"] + asset_counts["model"]
-        if system_depth < 5:
-            fail(
-                "Project quality check failed: games need deeper mechanics. "
-                "Add systems such as enemies, hazards, phases, abilities, camera, waves, levels, health, cooldowns, or objectives."
-            )
-        if presentation_depth < 6 and rich_asset_count < 2:
-            fail(
-                "Project quality check failed: game visuals are too flat. "
-                "Add camera/layers, procedural sprites or image assets, lighting, parallax, tiles/props, animation frames, shadows, and stronger effects before publishing."
-            )
-        if (
-            looks_like_sports_game
-            and PRIMITIVE_SHAPE_SIGNAL_RE.search(all_text)
-            and unique_signal_count(SPORTS_ARENA_RE, all_text) < 2
-            and rich_asset_count < 2
-        ):
-            fail(
-                "Project quality check failed: sports and arena games need more than primitive shapes. "
-                "Add stadium/crowd, ball or shot physics, keeper phases, replay/confetti, and stronger arena feedback before publishing."
-            )
-    elif layer_count < 2:
-        fail(
-            "Project quality check failed: pages and mini apps need at least two meaningful layers, "
-            "such as choices plus result, sections plus interaction, or input plus feedback before publishing."
-        )
-
-
-def inline_text_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
-    base = html_path.parent
-    warnings: list[str] = []
-
-    def inline_css_urls(css: str, css_base: Path) -> str:
-        def url_repl(match: re.Match[str]) -> str:
-            quote = match.group("quote") or ""
-            raw_url = match.group("url").strip()
-            asset = local_asset_path(css_base, raw_url)
-            if not asset:
-                return match.group(0)
-            size = asset.stat().st_size
-            if size > MAX_INLINE_ASSET_BYTES:
-                warnings.append(f"CSS asset too large to inline: {asset.name}")
-                return match.group(0)
-            mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-            encoded = base64.b64encode(asset.read_bytes()).decode("ascii")
-            return f"url({quote}data:{mime};base64,{encoded}{quote})"
-
-        asset_ext_pattern = "|".join(INLINE_ASSET_EXTENSIONS)
-        return re.sub(
-            rf"url\(\s*(?P<quote>['\"]?)(?P<url>[^)'\"]+\.({asset_ext_pattern})(?:[?#][^'\")]*)?)(?P=quote)\s*\)",
-            url_repl,
-            css,
-            flags=re.I,
-        )
-
-    def style_repl(match: re.Match[str]) -> str:
-        href = match.group("href")
-        asset = local_asset_path(base, href)
-        if not asset:
-            warnings.append(f"CSS not inlined: {href}")
-            return match.group(0)
-        return f"<style>\n{inline_css_urls(read_text(asset), asset.parent)}\n</style>"
-
-    def script_repl(match: re.Match[str]) -> str:
-        src = match.group("src")
-        asset = local_asset_path(base, src)
-        if not asset:
-            warnings.append(f"Script not inlined: {src}")
-            return match.group(0)
-        return f"<script>\n{read_text(asset)}\n</script>"
-
-    html = re.sub(
-        r"<link\b(?=[^>]*rel=[\"']?stylesheet[\"']?)(?=[^>]*href=[\"'](?P<href>[^\"']+)[\"'])[^>]*>",
-        style_repl,
-        html,
-        flags=re.I,
-    )
-    html = re.sub(
-        r"<script\b(?=[^>]*src=[\"'](?P<src>[^\"']+)[\"'])[^>]*>\s*</script>",
-        script_repl,
-        html,
-        flags=re.I,
-    )
-
-    def inline_style_block(match: re.Match[str]) -> str:
-        return f"{match.group('open')}{inline_css_urls(match.group('css'), base)}{match.group('close')}"
-
-    html = re.sub(
-        r"(?P<open><style\b[^>]*>)(?P<css>[\s\S]*?)(?P<close></style>)",
-        inline_style_block,
-        html,
-        flags=re.I,
-    )
-    return html, warnings
-
-
-def inline_binary_assets(html: str, html_path: Path) -> tuple[str, list[str]]:
-    base = html_path.parent
-    warnings: list[str] = []
-
-    def repl(match: re.Match[str]) -> str:
-        prefix = match.group("prefix")
-        src = match.group("src")
-        suffix = match.group("suffix")
-        asset = local_asset_path(base, src)
-        if not asset:
-            return match.group(0)
-        size = asset.stat().st_size
-        if size > MAX_INLINE_ASSET_BYTES:
-            warnings.append(f"Asset too large to inline: {asset.name}")
-            return match.group(0)
-        mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-        encoded = base64.b64encode(asset.read_bytes()).decode("ascii")
-        return f'{prefix}data:{mime};base64,{encoded}{suffix}'
-
-    asset_ext_pattern = "|".join(INLINE_ASSET_EXTENSIONS + ("mp4", "webm"))
-    html = re.sub(
-        rf"(?P<prefix>\b(?:src|href|poster)=['\"])(?P<src>[^'\"]+\.(?:{asset_ext_pattern})(?:[?#][^'\"]*)?)(?P<suffix>['\"])",
-        repl,
-        html,
-        flags=re.I,
-    )
-    return html, warnings
-
-
-def bundle_html(root_or_file: Path) -> tuple[str, str, list[str]]:
-    html_path = choose_html(root_or_file)
-    root = html_path.parent
-    scan_for_secrets(root)
-
-    html = read_text(html_path)
-    warnings: list[str] = []
-    html, w = inline_text_assets(html, html_path)
-    warnings.extend(w)
-    html, w = inline_binary_assets(html, html_path)
-    warnings.extend(w)
-
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else html_path.stem
-    return html, title[:80] or "Мой проект", warnings
-
-
-def safe_rel_path(path: Path, base: Path) -> str:
-    rel = path.relative_to(base).as_posix()
-    parts = rel.split("/")
-    if (
-        not rel
-        or rel.startswith("/")
-        or len(rel) > 180
-        or any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
-    ):
-        fail(f"Refusing unsafe project file path: {rel}")
-    return rel
-
-
-def add_referenced_project_file(base: Path, raw_url: str, project_root: Path, out: set[Path], seen: set[Path]) -> None:
-    candidate = local_reference_candidate(base, raw_url, project_root)
-    if not candidate:
-        return
-    out.add(candidate)
-    collect_referenced_project_files(candidate, project_root, out, seen)
+def scan_for_secrets(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
+    for path in [html_path] + upload_paths:
+        if path.suffix.lower() not in TEXT_EXTENSIONS:
+            continue
+        text = read_text(path)
+        for pattern in SECRET_PATTERNS:
+            if pattern.search(text):
+                fail(
+                    f"Refusing to publish: {path.name} appears to contain a secret",
+                    f"В файле {path.name} есть строка, похожая на секретный ключ или пароль. Убери её — секреты публиковать нельзя.",
+                )
 
 
 def collect_referenced_project_files(source: Path, project_root: Path, out: set[Path], seen: set[Path]) -> None:
@@ -697,8 +347,8 @@ def collect_referenced_project_files(source: Path, project_root: Path, out: set[
     text = read_text(source)
     js_text = ""
     if suffix in {".html", ".htm"}:
-        for match in HTML_LOCAL_REF_RE.finditer(text):
-            add_referenced_project_file(source.parent, html_reference_url(match), project_root, out, seen)
+        for match in HTML_QUOTED_REF_RE.finditer(text):
+            add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
         for match in CSS_URL_RE.finditer(text):
             add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
         js_text = text
@@ -712,37 +362,97 @@ def collect_referenced_project_files(source: Path, project_root: Path, out: set[
             add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
 
     if js_text:
-        for pattern in JS_LOCAL_REF_PATTERNS:
+        for pattern in JS_COLLECT_PATTERNS:
             for match in pattern.finditer(js_text):
                 add_referenced_project_file(source.parent, match.group("url"), project_root, out, seen)
 
 
-def project_file_manifest(root_or_file: Path, html_path: Path) -> list[dict]:
+def add_referenced_project_file(base: Path, raw_url: str, project_root: Path, out: set[Path], seen: set[Path]) -> None:
+    candidate = local_reference_candidate(base, raw_url, project_root)
+    if not candidate:
+        return
+    out.add(candidate)
+    collect_referenced_project_files(candidate, project_root, out, seen)
+
+
+def safe_rel_path(path: Path, base: Path) -> str | None:
+    rel = path.relative_to(base).as_posix()
+    parts = rel.split("/")
+    if (
+        not rel
+        or rel.startswith("/")
+        or len(rel) > 180
+        or any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
+    ):
+        return None
+    return rel
+
+
+def select_upload_files(root_or_file: Path, html_path: Path, warnings: list[str]) -> list[Path]:
+    """Pick which local files travel with index.html.
+
+    Anything unsupported is SKIPPED with a warning, never a failure: children's
+    folders legitimately contain CLAUDE.md, PROJECT.md, drafts, and old HTML
+    versions, and none of that may block publishing.
+    """
     base = html_path.parent
-    files: list[dict] = []
-    total_bytes = 0
     if root_or_file.is_file():
         referenced: set[Path] = set()
         collect_referenced_project_files(html_path, base, referenced, set())
-        candidate_files = sorted(referenced)
+        candidates = sorted(referenced)
     else:
-        candidate_files = project_files(base)
+        candidates = project_files(base)
 
-    for path in candidate_files:
+    selected: list[Path] = []
+    skipped: list[str] = []
+    for path in candidates:
         if path.resolve() == html_path.resolve():
             continue
+        rel = safe_rel_path(path, base)
+        if rel is None:
+            skipped.append(path.name)
+            continue
         suffix = path.suffix.lower()
-        if suffix not in PROJECT_FILE_EXTENSIONS:
-            fail(f"Unsupported project file type: {safe_rel_path(path, base)}")
+        if path.name.lower() in SECRET_FILE_NAMES:
+            skipped.append(rel)
+            continue
+        if suffix in {".html", ".htm"} or suffix not in PROJECT_FILE_EXTENSIONS:
+            skipped.append(rel)
+            continue
+        selected.append(path)
+
+    if skipped:
+        shown = ", ".join(sorted(skipped)[:8])
+        more = f" и ещё {len(skipped) - 8}" if len(skipped) > 8 else ""
+        warnings.append(
+            f"Не публикуются служебные и лишние файлы: {shown}{more}. "
+            "На wai.school уходит только index.html и файлы, которые нужны странице (картинки, стили, скрипты, звуки, данные)."
+        )
+    return selected
+
+
+def project_file_manifest(html_path: Path, upload_paths: list[Path]) -> list[dict]:
+    base = html_path.parent
+    files: list[dict] = []
+    total_bytes = 0
+    for path in upload_paths:
+        rel = safe_rel_path(path, base)
+        if rel is None:
+            continue
         size = path.stat().st_size
         if size <= 0:
             continue
         if size > MAX_PROJECT_FILE_BYTES:
-            fail(f"Project file is too large: {safe_rel_path(path, base)}")
+            fail(
+                f"Project file is too large: {rel}",
+                f"Файл {rel} больше 10 МБ. Сожми его (картинку — в WebP/JPEG, звук — в MP3/OGG) и попробуй снова.",
+            )
         total_bytes += size
         if total_bytes > MAX_PROJECT_TOTAL_FILE_BYTES:
-            fail(f"Project files are too large; limit is {MAX_PROJECT_TOTAL_FILE_BYTES} bytes")
-        rel = safe_rel_path(path, base)
+            fail(
+                f"Project files are too large; limit is {MAX_PROJECT_TOTAL_FILE_BYTES} bytes",
+                "Все файлы проекта вместе больше 50 МБ. Убери или сожми самые тяжёлые файлы.",
+            )
         files.append(
             {
                 "path": rel,
@@ -752,23 +462,28 @@ def project_file_manifest(root_or_file: Path, html_path: Path) -> list[dict]:
             }
         )
         if len(files) > MAX_PROJECT_FILES:
-            fail(f"Project has too many files; limit is {MAX_PROJECT_FILES}")
+            fail(
+                f"Project has too many files; limit is {MAX_PROJECT_FILES}",
+                "В проекте больше 400 файлов. Оставь только то, что реально использует страница.",
+            )
     return sorted(files, key=lambda file: file["path"])
 
 
 def bundle_project(root_or_file: Path) -> tuple[str, str, list[str], list[dict]]:
     html_path = choose_html(root_or_file)
-    root = html_path.parent
-    publish_input = html_path if root_or_file.is_file() else root
-    scan_for_secrets(root)
-    validate_local_references(publish_input, html_path)
-    files = project_file_manifest(publish_input, html_path)
-    validate_project_quality(publish_input, html_path)
+    warnings: list[str] = []
+    upload_paths = select_upload_files(root_or_file, html_path, warnings)
+    project_root = html_path.parent if root_or_file.is_file() else root_or_file
+
+    scan_for_secrets(project_root, html_path, upload_paths)
+    validate_forbidden_runtime(project_root, html_path, upload_paths)
+    validate_quoted_references(project_root, html_path, upload_paths)
+    files = project_file_manifest(html_path, upload_paths)
 
     html = read_text(html_path)
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else html_path.stem
-    return html, title[:80] or "Мой проект", [], files
+    return html, title[:80] or "Мой проект", warnings, files
 
 
 def state_path(root_or_file: Path) -> Path:
@@ -784,16 +499,22 @@ def load_state(path: Path) -> dict:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as error:
-        fail(f"Cannot read safe publish state at {path}: {error}")
+        fail(
+            f"Cannot read safe publish state at {path}: {error}",
+            "Не читается файл памяти проекта. Проверь права на папку и запусти команду ещё раз.",
+        )
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         fail(
-            f"Cannot read safe publish state at {path}: the file is corrupted. "
-            "Do not publish as a new project; restore the live project or ask a mentor to repair the state file."
+            f"Cannot read safe publish state at {path}: the file is corrupted.",
+            "Файл памяти проекта повреждён. Не публикуй проект как новый — позови ментора, он восстановит связь со старой ссылкой.",
         )
     if not isinstance(data, dict):
-        fail(f"Cannot read safe publish state at {path}: expected a JSON object.")
+        fail(
+            f"Cannot read safe publish state at {path}: expected a JSON object.",
+            "Файл памяти проекта повреждён. Не публикуй проект как новый — позови ментора.",
+        )
 
     state: dict = {}
     slug = data.get("slug")
@@ -802,40 +523,47 @@ def load_state(path: Path) -> dict:
     pending_request_id = data.get("pendingRequestId")
     current_revision = data.get("currentRevision")
 
+    corrupted_fix = "Файл памяти проекта повреждён — позови ментора."
     if slug is not None:
         if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,80}", slug):
-            fail(f"Cannot read safe publish state at {path}: invalid project slug.")
+            fail(f"Cannot read safe publish state at {path}: invalid project slug.", corrupted_fix)
         state["slug"] = slug
     if edit_token is not None:
         if not isinstance(edit_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", edit_token):
-            fail(f"Cannot read safe publish state at {path}: invalid edit capability.")
+            fail(f"Cannot read safe publish state at {path}: invalid edit capability.", corrupted_fix)
         state["editToken"] = edit_token
     if create_token is not None:
         if not isinstance(create_token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", create_token):
-            fail(f"Cannot read safe publish state at {path}: invalid create capability.")
+            fail(f"Cannot read safe publish state at {path}: invalid create capability.", corrupted_fix)
         state["createToken"] = create_token
     if pending_request_id is not None:
         if not isinstance(pending_request_id, str):
-            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.", corrupted_fix)
         try:
             parsed_request_id = uuid.UUID(pending_request_id)
         except ValueError:
-            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.", corrupted_fix)
         if str(parsed_request_id) != pending_request_id.lower():
-            fail(f"Cannot read safe publish state at {path}: invalid pending request id.")
+            fail(f"Cannot read safe publish state at {path}: invalid pending request id.", corrupted_fix)
         state["pendingRequestId"] = pending_request_id
     if current_revision is not None:
         if isinstance(current_revision, bool) or not isinstance(current_revision, int) or current_revision <= 0:
-            fail(f"Cannot read safe publish state at {path}: invalid project revision.")
+            fail(f"Cannot read safe publish state at {path}: invalid project revision.", corrupted_fix)
         state["currentRevision"] = current_revision
     if "owned" in data and not isinstance(data["owned"], bool):
-        fail(f"Cannot read safe publish state at {path}: invalid ownership marker.")
+        fail(f"Cannot read safe publish state at {path}: invalid ownership marker.", corrupted_fix)
     if data.get("owned") is True:
         state["owned"] = True
     if not state:
-        fail(f"Cannot read safe publish state at {path}: no usable project identity or pending request.")
+        fail(
+            f"Cannot read safe publish state at {path}: no usable project identity or pending request.",
+            "Файл памяти проекта пуст или повреждён — позови ментора.",
+        )
     if (state.get("editToken") or state.get("owned") or state.get("currentRevision")) and not state.get("slug"):
-        fail(f"Cannot read safe publish state at {path}: project identity is incomplete.")
+        fail(
+            f"Cannot read safe publish state at {path}: project identity is incomplete.",
+            "Файл памяти проекта неполный — позови ментора.",
+        )
     return state
 
 
@@ -855,8 +583,8 @@ def load_project_state(root_or_file: Path) -> tuple[Path, dict]:
     )
     if html_files != [root_or_file.resolve()]:
         fail(
-            f"Cannot safely match legacy publish state {legacy} to {root_or_file.name}: this folder contains several HTML files. "
-            "Move the selected project into its own folder or ask a mentor to identify the correct project state."
+            f"Cannot safely match legacy publish state {legacy} to {root_or_file.name}: this folder contains several HTML files.",
+            "В папке несколько HTML-файлов, и непонятно, чья это память публикации. Перенеси нужный проект в отдельную папку или позови ментора.",
         )
 
     state = load_state(legacy)
@@ -864,7 +592,7 @@ def load_project_state(root_or_file: Path) -> tuple[Path, dict]:
         write_state_atomic(preferred, state)
         legacy.unlink()
     except OSError as error:
-        fail(f"Cannot migrate safe publish state from {legacy} to {preferred}: {error}")
+        fail(f"Cannot migrate safe publish state from {legacy} to {preferred}: {error}", "Не получилось перенести память проекта. Позови ментора.")
     return preferred, state
 
 
@@ -939,15 +667,16 @@ def project_arg_to_slug(value: str) -> str:
     match = re.search(r"(?:^|/)project/([a-z0-9][a-z0-9-]{2,80})(?:[/?#]|$)", raw)
     if match:
         return match.group(1)
-    fail("Project must be a wai.school/project/... URL or a project slug.")
+    fail(
+        "Project must be a wai.school/project/... URL or a project slug.",
+        "Передай в --project живую ссылку вида https://wai.school/project/имя-проекта.",
+    )
 
 
 def source_endpoint_for_slug(slug: str) -> str:
     parsed = urllib.parse.urlparse(ENDPOINT)
     path = parsed.path.rstrip("/")
-    if path.endswith("/api/projects/publish"):
-        source_path = path[: -len("/publish")] + f"/source/{slug}"
-    elif path.endswith("/publish"):
+    if path.endswith("/publish"):
         source_path = path[: -len("/publish")] + f"/source/{slug}"
     else:
         source_path = f"/api/projects/source/{slug}"
@@ -956,7 +685,10 @@ def source_endpoint_for_slug(slug: str) -> str:
 
 def fetch_source_manifest(slug: str, publish_token: str = "", edit_token: str = "") -> dict:
     if bool(publish_token) == bool(edit_token):
-        fail("Restoring an existing project needs exactly one saved edit token or --publish-token.")
+        fail(
+            "Restoring an existing project needs exactly one saved edit token or --publish-token.",
+            "Для восстановления нужен publish-token из кабинета или сохранённая память проекта. Позови ментора, если ни того ни другого нет.",
+        )
     credential = {"publishToken": publish_token} if publish_token else {"editToken": edit_token}
     payload = json.dumps(credential, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -979,7 +711,7 @@ def fetch_source_manifest(slug: str, publish_token: str = "", edit_token: str = 
             message = body or str(e)
         fail(f"Server rejected source restore ({e.code}): {message}")
     except urllib.error.URLError as e:
-        fail(f"Could not reach WAI School source server: {e}")
+        fail(f"Could not reach WAI School source server: {e}", NETWORK_FIX_RU)
     except json.JSONDecodeError:
         fail("WAI School source server returned invalid JSON")
 
@@ -1024,7 +756,10 @@ def decode_manifest_file(content_base64: str, path: str) -> bytes:
 
 def validate_restore_target(target: Path, force: bool) -> None:
     if force and not target.name.startswith("wai-school-project"):
-        fail("For safety, --force restore only works with a folder named wai-school-project...")
+        fail(
+            "For safety, --force restore only works with a folder named wai-school-project...",
+            "Восстановление с --force работает только в папку с именем, начинающимся на wai-school-project.",
+        )
     if target.exists() and target.is_symlink():
         fail("Restore target must be a real folder, not a symlink.")
     if target.exists() and not target.is_dir():
@@ -1038,7 +773,10 @@ def validate_restore_target(target: Path, force: bool) -> None:
     if target.exists():
         existing = [p for p in target.iterdir() if p.name != STATE_FILE_NAME]
         if existing and not force:
-            fail("Restore target folder is not empty. Use a clean folder or pass --force.")
+            fail(
+                "Restore target folder is not empty. Use a clean folder or pass --force.",
+                "Папка для восстановления не пустая. Укажи новую пустую папку.",
+            )
 
 
 def clear_restore_target(target: Path) -> None:
@@ -1191,19 +929,86 @@ def publish(
         except json.JSONDecodeError:
             message = body or str(e)
         if re.search(r"host.*not.*allow|allowlist|egress|blocked", message, re.I):
-            fail(
-                "Claude code environment cannot reach wai.school. "
-                "Ask a mentor to allow wai.school network access or publish through the WAI School page."
-            )
+            fail("Claude code environment cannot reach wai.school.", NETWORK_FIX_RU)
         raise ProjectPublishHttpError(e.code, str(data.get("code") or "publish_rejected"), str(message), data)
     except urllib.error.URLError as e:
         message = str(e.reason if hasattr(e, "reason") else e)
         if re.search(r"host.*not.*allow|allowlist|egress|blocked|name or service not known", message, re.I):
-            fail(
-                "Claude code environment cannot reach wai.school. "
-                "Ask a mentor to allow wai.school network access or publish through the WAI School page."
+            fail("Claude code environment cannot reach wai.school.", NETWORK_FIX_RU)
+        fail(f"Could not reach WAI School publish server: {e}", NETWORK_FIX_RU)
+
+
+def run_doctor(target: Path) -> None:
+    """One command a mentor can run to see what works: Python, files, network."""
+    report: list[str] = []
+    ok = True
+
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    if sys.version_info < (3, 8):
+        ok = False
+        report.append(f"✗ Python {version} — слишком старый, нужен 3.8+. Поставь свежий Python с python.org.")
+    else:
+        report.append(f"✓ Python {version}")
+
+    report.append(f"✓ Publisher {SKILL_VERSION} ({Path(__file__).resolve()})")
+
+    if target.exists() and target.is_dir():
+        state_file = state_path(target)
+        if state_file.exists():
+            state = load_state(state_file)
+            report.append(
+                f"✓ Память проекта найдена: ссылка уже есть (slug {state.get('slug')}, версия {state.get('currentRevision')})"
             )
-        fail(f"Could not reach WAI School publish server: {e}")
+        else:
+            report.append("· Памяти проекта в этой папке нет — первая публикация создаст новую ссылку.")
+
+    # The probe must satisfy even the strict legacy quality gate, so the doctor
+    # works against older server builds too.
+    probe_html = (
+        "<!doctype html><html lang=\"ru\"><head><title>Проверка WAI School</title>"
+        "<style>body{background:linear-gradient(#20242c,#3b4252);color:#fff;font-family:sans-serif}"
+        ".card{padding:24px;transition:transform .2s}</style></head>"
+        "<body><main class=\"card\"><h1>Проверка публикации WAI School</h1>"
+        "<p>Это тестовая страница доктора: нажми кнопку и посмотри результат выбора.</p>"
+        "<button onclick=\"go()\">Сделать выбор</button><div id=\"r\"></div>"
+        "<script>function go(){document.getElementById('r').textContent='Результат: победа, проверка пройдена!';}"
+        "</script></main></body></html>"
+    )
+    probe = {
+        "html": probe_html,
+        "title": "doctor",
+        "source": "claude-code-publisher",
+        "skillVersion": SKILL_VERSION,
+        "validateOnly": True,
+    }
+    try:
+        req = urllib.request.Request(
+            ENDPOINT,
+            data=json.dumps(probe).encode("utf-8"),
+            headers={"content-type": "application/json", "user-agent": f"wai-school-publish/{SKILL_VERSION}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        if data.get("ok"):
+            report.append(f"✓ Сервер wai.school отвечает (проверка без публикации прошла, version {data.get('version')})")
+        else:
+            ok = False
+            report.append(f"✗ Сервер ответил без ok: {data}")
+    except urllib.error.HTTPError as error:
+        ok = False
+        body = error.read().decode("utf-8", errors="replace")[:300]
+        report.append(f"✗ Сервер wai.school отклонил тестовую проверку (HTTP {error.code}): {body}")
+        report.append("  → Соединение есть, но сервер отвечает ошибкой. Перешли этот вывод в чат школы.")
+    except Exception as error:  # noqa: BLE001 — any transport failure reads the same for a mentor
+        ok = False
+        report.append(f"✗ Нет соединения с wai.school: {error}")
+        report.append("  → Проверь интернет. Если Claude пишет про запрет сети — публикуй через wai.school/student.")
+
+    for line in report:
+        print(line, file=sys.stderr)
+    print(json.dumps({"ok": ok, "doctor": report}, ensure_ascii=False))
+    raise SystemExit(0 if ok else 1)
 
 
 def main() -> None:
@@ -1217,9 +1022,12 @@ def main() -> None:
     parser.add_argument("--restore", action="store_true", help="Restore an existing owned project into --dir before editing")
     parser.add_argument("--force", action="store_true", help="Allow --restore to replace files in the target folder")
     parser.add_argument("--dry-run", action="store_true", help="Bundle and validate locally, but do not upload")
+    parser.add_argument("--doctor", action="store_true", help="Check Python, publisher files, and wai.school connectivity")
     args = parser.parse_args()
 
     target = Path(args.dir).expanduser().resolve()
+    if args.doctor:
+        run_doctor(target)
     publish_token = (args.publish_token or os.environ.get("WAI_SCHOOL_PUBLISH_TOKEN", "")).strip()
     explicit_slug = project_arg_to_slug(args.project)
     expected_url = (args.expect_url or "").strip()
@@ -1227,7 +1035,10 @@ def main() -> None:
         project_arg_to_slug(expected_url)
     if args.restore:
         if not explicit_slug:
-            fail("Restoring a project needs --project with a wai.school/project/... URL or slug.")
+            fail(
+                "Restoring a project needs --project with a wai.school/project/... URL or slug.",
+                "Добавь --project https://wai.school/project/... — какую ссылку восстанавливаем.",
+            )
         restore_state = load_state(state_path(target)) if target.exists() else {}
         edit_token = str(restore_state.get("editToken") or "") if restore_state.get("slug") == explicit_slug else ""
         result = restore_project_source(
@@ -1242,7 +1053,7 @@ def main() -> None:
         return
 
     if not target.exists():
-        fail(f"Path does not exist: {target}")
+        fail(f"Path does not exist: {target}", "Проверь путь в --dir: такой папки или файла нет.")
 
     html, title, warnings, files = bundle_project(target)
     state_file, state = load_project_state(target)
@@ -1274,7 +1085,10 @@ def main() -> None:
         )
         return
     if state.get("slug") and not state.get("editToken") and not publish_token:
-        fail("Updating an existing project by slug needs --publish-token or a saved edit token.")
+        fail(
+            "Updating an existing project by slug needs --publish-token or a saved edit token.",
+            "Чтобы обновить эту ссылку, нужен publish-token из кабинета ребёнка или память проекта в этой папке. Позови ментора.",
+        )
     if state.get("slug") and not state.get("currentRevision"):
         live_target = restore_live_conflict_copy(
             state["slug"],
@@ -1285,8 +1099,8 @@ def main() -> None:
             str(state.get("editToken") or ""),
         )
         fail(
-            f"This project state predates safe versions. The current live source was restored to {live_target}. "
-            "Compare it with your working folder, merge the intended changes there, and publish that restored folder."
+            f"This project state predates safe versions. The current live source was restored to {live_target}.",
+            f"Живая версия проекта скопирована в папку {live_target}. Сравни её со своей, перенеси нужные изменения туда и публикуй из неё.",
         )
 
     request_id = str(state.get("pendingRequestId") or uuid.uuid4())
@@ -1296,7 +1110,7 @@ def main() -> None:
     try:
         save_pending_state(state_file, state, request_id, create_token)
     except OSError as error:
-        fail(f"Cannot save safe publish state at {state_file}: {error}")
+        fail(f"Cannot save safe publish state at {state_file}: {error}", "Не получилось записать файл памяти проекта. Проверь права на папку.")
     try:
         result = publish(html, title, state, files, request_id, publish_token, create_token)
     except ProjectPublishHttpError as error:
@@ -1316,7 +1130,8 @@ def main() -> None:
                 )
                 fail(
                     f"Server rejected publish ({error.status}): {error.message} "
-                    f"The live version {revision} was restored to {live_target}. Compare, merge, and publish that folder."
+                    f"The live version {revision} was restored to {live_target}.",
+                    f"Проект уже обновили в другом месте. Живая версия скопирована в {live_target} — сравни, перенеси свои изменения туда и публикуй из неё.",
                 )
         fail(f"Server rejected publish ({error.status}): {error.message}")
     if result.get("ok"):
@@ -1329,17 +1144,18 @@ def main() -> None:
         except OSError as error:
             fail(
                 f"Project published at {result.get('url') or 'an unknown URL'}, but its update state could not be saved at "
-                f"{state_file}: {error}. Fix access to this file and run the same command again."
+                f"{state_file}: {error}. Fix access to this file and run the same command again.",
             )
         if not state_saved:
             fail(
                 f"Project published at {result.get('url') or 'an unknown URL'}, but the server response did not contain "
-                "a safe update token or revision. Run the same command again; do not create another project."
+                "a safe update token or revision. Run the same command again; do not create another project.",
             )
         result["projectStateSaved"] = True
         if result.get("editToken"):
             del result["editToken"]
-    result["warnings"] = warnings
+    server_warnings = result.get("warnings")
+    result["warnings"] = warnings + (server_warnings if isinstance(server_warnings, list) else [])
     print(json.dumps(result, ensure_ascii=False))
 
 
