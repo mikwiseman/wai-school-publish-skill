@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-07-20.2"
+SKILL_VERSION = "2026-07-20.3"
 MAX_PROJECT_FILES = 400
 MAX_PROJECT_FILE_BYTES = 10_000_000
 MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
@@ -983,6 +983,24 @@ def publish(
         fail(f"Could not reach WAI School publish server: {e}", NETWORK_FIX_RU)
 
 
+def version_tuple(value: str) -> tuple:
+    return tuple(int(part) for part in re.findall(r"\d+", value))
+
+
+def fetch_published_version() -> str:
+    """Best-effort read of the latest publisher version from wai.school."""
+    parsed = urllib.parse.urlparse(ENDPOINT)
+    url = urllib.parse.urlunparse(parsed._replace(path="/tools/wai-school-publish.py", params="", query="", fragment=""))
+    try:
+        req = urllib.request.Request(url, headers={"user-agent": f"wai-school-publish/{SKILL_VERSION}"})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            head = res.read(4096).decode("utf-8", errors="replace")
+        match = re.search(r'SKILL_VERSION = "([^"]+)"', head)
+        return match.group(1) if match else ""
+    except Exception:  # noqa: BLE001 — version hint only, never blocks the doctor
+        return ""
+
+
 def run_doctor(target: Path) -> None:
     """One command a mentor can run to see what works: Python, files, network."""
     report: list[str] = []
@@ -997,13 +1015,31 @@ def run_doctor(target: Path) -> None:
 
     report.append(f"✓ Publisher {SKILL_VERSION} ({Path(__file__).resolve()})")
 
+    # Doctor must finish its report even when one check dies, so a mentor sees
+    # the whole picture in one run.
+    latest = fetch_published_version()
+    if latest and version_tuple(latest) > version_tuple(SKILL_VERSION):
+        report.append(
+            f"! Доступна новая версия publisher ({latest}, у тебя {SKILL_VERSION}). "
+            "Попроси ментора повторить установку: wai.school/start/publish/setup — команды перезапишут файлы."
+        )
+    elif latest:
+        report.append("✓ Версия publisher — последняя.")
+
     if target.exists() and target.is_dir():
         state_file = state_path(target)
         if state_file.exists():
-            state = load_state(state_file)
-            report.append(
-                f"✓ Память проекта найдена: ссылка уже есть (slug {state.get('slug')}, версия {state.get('currentRevision')})"
-            )
+            try:
+                state = load_state(state_file)
+                report.append(
+                    f"✓ Память проекта найдена: ссылка уже есть (slug {state.get('slug')}, версия {state.get('currentRevision')})"
+                )
+            except SystemExit:
+                ok = False
+                report.append(
+                    "✗ Память проекта в этой папке повреждена — обновить старую ссылку не получится. "
+                    "Не публикуй проект как новый: напиши в чат школы, ментор восстановит связь со ссылкой."
+                )
         else:
             report.append("· Памяти проекта в этой папке нет — первая публикация создаст новую ссылку.")
 

@@ -1,6 +1,6 @@
 ---
 name: wai-school-publish
-description: Публикация детского статичного HTML/CSS/JS проекта на wai.school со стабильной ссылкой wai.school/project/... Use when the user asks to publish, upload, deploy, share or update a project on WAI School — «опубликуй», «выложи», «сделай ссылку», «обнови сайт/игру», «поделиться проектом».
+description: Публикация детского статичного HTML/CSS/JS проекта на wai.school со стабильной ссылкой wai.school/project/... Use when the user asks to publish, upload, deploy, share or update a project on WAI School — «опубликуй», «выложи», «сделай ссылку», «обнови сайт/игру», «поделиться проектом» — or asks to check publishing: «доктор публикации», «проверь публикацию WAI School».
 ---
 
 # Публикация проекта на WAI School
@@ -120,4 +120,6 @@ https://wai.school/project/...
 <PY> <SCRIPT> --doctor --dir <папка-проекта>
 ```
 
-Доктор по-русски покажет: какой Python найден, где лежит publisher, есть ли у папки сохранённая ссылка и отвечает ли сервер wai.school. Этот вывод можно целиком переслать в чат школы.
+Доктор по-русски покажет: какой Python найден, где лежит publisher и последняя ли это версия, есть ли у папки сохранённая ссылка и отвечает ли сервер wai.school. Этот вывод можно целиком переслать в чат школы.
+
+Обновление скилла: повторите установку со страницы wai.school/start/publish/setup — те же команды перезапишут файлы свежей версией. После обновления один раз перезапустите Claude Code. Доктор сам подскажет, когда версия устарела.
