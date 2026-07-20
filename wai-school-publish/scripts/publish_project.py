@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 
 ENDPOINT = os.environ.get("WAI_SCHOOL_PUBLISH_ENDPOINT", "https://wai.school/api/projects/publish")
-SKILL_VERSION = "2026-07-20.1"
+SKILL_VERSION = "2026-07-20.2"
 MAX_PROJECT_FILES = 400
 MAX_PROJECT_FILE_BYTES = 10_000_000
 MAX_PROJECT_TOTAL_FILE_BYTES = 50_000_000
@@ -90,10 +90,20 @@ HTML_QUOTED_REF_RE = re.compile(
     r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(['"])(?P<url>[^'"]+)\1""",
     re.I,
 )
+# Attribute references (quoted or unquoted) are validated only OUTSIDE <script>
+# blocks: JS assignments like `img.src = photoMap.preview;` are code, not
+# paths, and treating them as paths broke real children's projects.
+HTML_ANY_REF_RE = re.compile(
+    r"""(?<![-:\w])(?:src|href|poster)\s*=\s*(?:(['"])(?P<quoted>[^'"]+)\1|(?P<unquoted>[^\s"'=<>`]+))""",
+    re.I,
+)
+SCRIPT_BLOCK_RE = re.compile(r"""<script\b[^>]*>[\s\S]*?</script>""", re.I)
+SCRIPT_OPEN_TAG_RE = re.compile(r"""<script\b[^>]*>""", re.I)
 CSS_URL_RE = re.compile(r"""url\(\s*(?P<quote>['"]?)(?P<url>[^)'"]+)(?P=quote)\s*\)""", re.I)
 GLTF_URI_RE = re.compile(r"""["']uri["']\s*:\s*["'](?P<url>[^"']+)["']""", re.I)
-# Broad JS patterns are used only to COLLECT extra files for upload (a found
-# file always exists); they are never used to fail a publish.
+# JS quoted-literal patterns: used to COLLECT extra files for upload, and to
+# validate a literal only when it names a concrete asset path with a known
+# extension (fetch('./levels/one.json')). Dynamic expressions never fail.
 JS_COLLECT_PATTERNS = [
     re.compile(r"""\bfetch\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*(?:[,)]|$)"""),
     re.compile(r"""\bimport\s*\(\s*(['"`])(?P<url>[^'"`]+)\1\s*\)"""),
@@ -286,21 +296,56 @@ def check_quoted_reference(base: Path, raw_url: str, project_root: Path, source:
             f"Missing local project file referenced from {source.relative_to(project_root)}: {value}",
             f"Страница использует файл «{ref_path}», но его нет в папке. Добавь файл или исправь путь.",
         )
+    # A reference to an existing file that publishing cannot carry would break
+    # silently on the live page — refuse with the exact repair instead.
+    if suffix in {".html", ".htm"}:
+        fail(
+            f"Secondary HTML page referenced from {source.relative_to(project_root)}: {value}",
+            f"Публикуется только одна страница index.html. Перенеси содержимое «{ref_path}» в index.html (например, отдельным экраном или разделом) или убери ссылку на него.",
+        )
+    if suffix not in PROJECT_FILE_EXTENSIONS:
+        fix = f"Формат файла «{ref_path}» не поддерживается публикацией. Убери ссылку на него или замени файл на поддерживаемый формат."
+        if suffix == ".svg":
+            fix = f"SVG-файлы не публикуются отдельными файлами. Вставь содержимое «{ref_path}» прямо в index.html как inline <svg> или сохрани картинку в PNG/WebP."
+        fail(f"Unsupported referenced file type from {source.relative_to(project_root)}: {value}", fix)
 
 
-def validate_quoted_references(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
+def html_any_reference_url(match: re.Match) -> str:
+    return match.group("quoted") or match.group("unquoted") or ""
+
+
+def validate_js_literals(source: Path, text: str, project_root: Path) -> None:
+    for pattern in JS_COLLECT_PATTERNS:
+        for match in pattern.finditer(text):
+            value = (match.group("url") or "").strip()
+            if value.startswith(("http://", "https://")):
+                check_quoted_reference(source.parent, value, project_root, source)
+                continue
+            suffix = Path(urllib.parse.urlparse(value).path or "").suffix.lower()
+            if suffix and (suffix in PROJECT_FILE_EXTENSIONS or suffix in {".html", ".htm"}):
+                check_quoted_reference(source.parent, value, project_root, source)
+
+
+def validate_references(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
     for path in [html_path] + upload_paths:
         suffix = path.suffix.lower()
         if suffix in {".html", ".htm"}:
             text = read_text(path)
-            for match in HTML_QUOTED_REF_RE.finditer(text):
+            for tag in SCRIPT_OPEN_TAG_RE.findall(text):
+                for match in HTML_ANY_REF_RE.finditer(tag):
+                    check_quoted_reference(path.parent, html_any_reference_url(match), project_root, path)
+            stripped = SCRIPT_BLOCK_RE.sub(" ", text)
+            for match in HTML_ANY_REF_RE.finditer(stripped):
+                check_quoted_reference(path.parent, html_any_reference_url(match), project_root, path)
+            for match in CSS_URL_RE.finditer(stripped):
                 check_quoted_reference(path.parent, match.group("url"), project_root, path)
-            for match in CSS_URL_RE.finditer(text):
-                check_quoted_reference(path.parent, match.group("url"), project_root, path)
+            validate_js_literals(path, text, project_root)
         elif suffix == ".css":
             text = read_text(path)
             for match in CSS_URL_RE.finditer(text):
                 check_quoted_reference(path.parent, match.group("url"), project_root, path)
+        elif suffix in {".js", ".mjs"}:
+            validate_js_literals(path, read_text(path), project_root)
 
 
 def validate_forbidden_runtime(project_root: Path, html_path: Path, upload_paths: list[Path]) -> None:
@@ -477,7 +522,7 @@ def bundle_project(root_or_file: Path) -> tuple[str, str, list[str], list[dict]]
 
     scan_for_secrets(project_root, html_path, upload_paths)
     validate_forbidden_runtime(project_root, html_path, upload_paths)
-    validate_quoted_references(project_root, html_path, upload_paths)
+    validate_references(project_root, html_path, upload_paths)
     files = project_file_manifest(html_path, upload_paths)
 
     html = read_text(html_path)
